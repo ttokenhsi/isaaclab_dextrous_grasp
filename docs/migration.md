@@ -40,20 +40,40 @@ The IsaacLab implementation lives in
 | `[3:6]`  | Palm world-frame **angular** velocity command | same                                                      |
 | `[6:22]` | Allegro 16-DoF joint position targets         | `relocate_env.py::pre_step`                               |
 
-`IKHandAction` (in `mdp/actions.py`):
+`IKHandAction` (in `mdp/actions.py`) implements ViViDex's velocity-based
+control loop **byte-for-byte** rather than going through IsaacLab's
+`DifferentialIKController` wrapper:
 
-1. Scales `[-1, 1]` to physical limits (`cart_lin_vel_limit=1.0`,
+1. **Scale** `[-1, 1]` to physical limits (`cart_lin_vel_limit=1.0`,
    `cart_ang_vel_limit=1.0`, Allegro per-joint `joint_limits`).
-2. Feeds the 6-DoF palm twist to a `DifferentialIKController`
-   (`command_type="velocity"`, damping `0.05`) whose Jacobian is taken from
-   `right_gripper_palm_link`. This yields 6 arm joint deltas per env.
-3. Adds the deltas to the current arm qpos to obtain absolute targets, and
-   concatenates with the 16 hand qpos targets.
-4. Applies `articulation.set_joint_position_target(targets)`.
+2. **Solve DLS IK** *once* per outer step in `process_actions`:
 
-Two byproducts are cached on the action term for use by reward terms:
+       J ∈ ℝ^{6×6}  = jacobian(palm, arm_joints)        # world frame
+       arm_qvel     = Jᵀ (J Jᵀ + λ²I)⁻¹ · v_des          # λ = 0.05
+       arm_qvel     = clip(arm_qvel, ±π)                 # ViViDex line 168
+       arm_qpos_des = arm_qpos + arm_qvel · dt_ctrl
 
-- `cartesian_error`: `‖actual_palm_lin_vel − target_lin_vel‖²` per env.
+   This is **bit-equivalent** to ViViDex's `get_arm_qvel` (verified to
+   `~1e-7` agreement; see `scripts/test_ik.py` Test B). We deliberately do
+   NOT use `DifferentialIKController` because it would re-solve IK at
+   every PhysX sub-step against a stale pose target, and worse, it has no
+   way to expose the integrated `arm_qvel` that we need for velocity
+   feedforward.
+3. **Apply** *both* targets every PhysX sub-step in `apply_actions`:
+
+       articulation.set_joint_position_target([arm_qpos_des, hand_qpos_des])
+       articulation.set_joint_velocity_target([arm_qvel,    0])
+
+   The velocity feedforward is **critical**: without it, the high-`kd`
+   PD gains we copy from ViViDex (arm `kd=40000`) act as a strong brake
+   on the joint velocity and the IK-derived `arm_qpos_des` is never
+   realised. See Pitfall #13.
+
+Two byproducts are cached on the env for use by reward terms:
+
+- `cartesian_error`: `‖Δpalm − v_des · dt_ctrl‖` per env, updated every
+  sub-step using `step_dt` so the **final** value (after all decimation
+  sub-steps) matches ViViDex's outer-step convention.
 - `target_lin_vel`: the unscaled 3-d palm linear velocity command.
 
 This matches `compute_inverse_kinematics` exactly in geometry (Jacobian
@@ -364,6 +384,31 @@ future maintainers don't re-discover them:
     `AllegroRelocateManagerEnv.__init__` (before `super().__init__`) as
     `max(16384, 64 × num_envs)`, which gives ~2× headroom over the
     empirical 17 pairs/env seen at 4096 envs.
+13. **Velocity feedforward in the implicit-PD controller is mandatory.**
+    ViViDex's SAPIEN actor sets *both* `set_drive_target(arm_qpos_des)`
+    and `set_drive_velocity_target(arm_qvel)` before each `step()`, so
+    the joint torque is `kp · (q* − q) + kd · (q̇* − q̇)`. IsaacLab's
+    `DifferentialInverseKinematicsAction` only writes the **position**
+    target; with the high arm `kd = 40000` we have to copy from
+    ViViDex (Pitfall #14), the missing `q̇*` term turns `kd · q̇` into
+    a strong braking torque and the arm ends up tracking only ~17 % of
+    the IK-derived displacement (`scripts/test_ik.py` Test C). We
+    therefore write our own `IKHandAction` that bypasses
+    `DifferentialIKController`: the DLS solve happens once per outer
+    step in `process_actions`, the resulting `(arm_qpos_des, arm_qvel)`
+    are pushed via *both* `set_joint_position_target` and
+    `set_joint_velocity_target` every PhysX sub-step in
+    `apply_actions`, and the `cartesian_error` is updated against
+    `step_dt` (not `physics_dt`) so the post-step value matches
+    ViViDex's outer-step convention.
+14. **PD gains must mirror SAPIEN's `set_drive_property`.** ViViDex
+    sets the arm to `(stiffness=200000, damping=40000,
+    force_limit=500)` and the hand to `(stiffness=200, damping=60,
+    force_limit=10)`. Earlier defaults of `(20000, 400, 300)` and
+    `(damping=10)` were 10–100× too soft for the arm and 6× for the
+    hand, which made the imitation tracking term saturate to
+    `exp(−10 × large_err)` ≈ 0 within a few steps. We now match the
+    ViViDex values exactly in `manager_env_cfg.py`.
 
 ---
 

@@ -172,18 +172,28 @@ def _build_robot_cfg(prim_path: str = "{ENV_REGEX_NS}/Robot") -> ArticulationCfg
             joint_pos=INIT_QPOS,
             joint_vel={name: 0.0 for name in INIT_QPOS},
         ),
+        # Arm/hand PD gains aligned with vividex's
+        # ``common_robot_utils.load_robot``::
+        #
+        #     robot_arm_control_params = (200_000, 40_000, 500)   # kp, kd, force
+        #     finger_control_params    = (200,        60,  10)
+        #
+        # The arm gains are intentionally far stiffer than physical hardware
+        # ("# This PD is far larger than real to improve stability" -- vividex)
+        # so that the IK target tracking error stays sub-mm and the imitate
+        # reward landscape remains informative.
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=ARM_JOINT_NAMES,
-                stiffness=20000.0,
-                damping=400.0,
-                effort_limit=300.0,
+                stiffness=200000.0,
+                damping=40000.0,
+                effort_limit=500.0,
                 velocity_limit=2.0 * math.pi,
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=HAND_JOINT_NAMES,
                 stiffness=200.0,
-                damping=10.0,
+                damping=60.0,
                 effort_limit=10.0,
                 velocity_limit=2.0 * math.pi,
             ),
