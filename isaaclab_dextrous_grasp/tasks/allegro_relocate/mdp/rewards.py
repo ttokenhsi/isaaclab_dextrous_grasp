@@ -38,6 +38,12 @@ if TYPE_CHECKING:
     from ..manager_env import AllegroRelocateManagerEnv
 
 
+# Force-magnitude threshold used to decide whether a phalange link is in
+# contact with the object. Chosen to match ViViDex's impulse threshold
+# (1e-2 N·s) divided by their sim step (2 ms) ≈ 5 N.
+_CONTACT_FORCE_THRESH: float = 5.0
+
+
 # ---------------------------------------------------------------------------
 # Intermediate quantity cache
 # ---------------------------------------------------------------------------
@@ -57,10 +63,14 @@ def _ensure_intermediates(env: "AllegroRelocateManagerEnv") -> dict:
     robot = env.scene["robot"]
     obj = env.scene["object"]
 
-    # ---- positions -------------------------------------------------------
-    finger_pos = robot.data.body_pos_w[:, env._finger_body_idx]  # (E, 4, 3)
-    obj_pos = obj.data.root_pos_w                                # (E, 3)
-    obj_quat = obj.data.root_quat_w                              # (E, 4)
+    # ---- positions (convert global-world → env-local to match the trajectory
+    # buffers, which are stored in the canonicalised env-local frame -- the
+    # one ViViDex calls "world frame" because its single-env SAPIEN world
+    # already coincides with our env-local frame). --------------------------
+    env_origins = env.scene.env_origins  # (E, 3) per-env offset in global world
+    finger_pos = robot.data.body_pos_w[:, env._finger_body_idx] - env_origins.unsqueeze(1)  # (E, 4, 3)
+    obj_pos = obj.data.root_pos_w - env_origins                  # (E, 3)
+    obj_quat = obj.data.root_quat_w                              # (E, 4) -- frame-independent
 
     # ---- index trajectory references ------------------------------------
     pregrasp_steps = env._pregrasp_steps  # (E,)
@@ -85,27 +95,35 @@ def _ensure_intermediates(env: "AllegroRelocateManagerEnv") -> dict:
     obj_rot_err = (2.0 * torch.acos(dot)) / torch.pi  # normalized to [0, 1]
 
     # ---- contact buckets via ContactSensor ------------------------------
-    # Each sensor has 1 body + 1 filter; force_matrix_w shape (N, 1, 1, 3).
-    # We threshold ||F|| > 1e-2/dt → contact bool (matches vividex impulse threshold).
-    sensors = [
-        env.scene.sensors["palm_contact"],
-        env.scene.sensors["thumb_contact"],
-        env.scene.sensors["index_contact"],
-        env.scene.sensors["middle_contact"],
-        env.scene.sensors["ring_contact"],
+    # 1 sensor per phalange link (16 total = 1 palm + 15 finger phalanges).
+    # ViViDex (relocate_env.py:204-205) ORs each finger's 3-4 phalanges to a
+    # single per-finger bucket via ``np.bincount(finger_contact_ids, ...)``;
+    # we do the same here over a list of (bucket → sensor names).
+    # ViViDex's threshold is impulse > 1e-2 N·s @ sim_dt=2ms → ~5 N effective
+    # force; we use the same.
+    bucket_groups = [
+        ["palm_contact"],                                            # palm
+        ["thumb_phalange_0", "thumb_phalange_1", "thumb_phalange_2"],  # 3 thumb links
+        ["index_phalange_0", "index_phalange_1", "index_phalange_2", "index_phalange_3"],
+        ["middle_phalange_0", "middle_phalange_1", "middle_phalange_2", "middle_phalange_3"],
+        ["ring_phalange_0", "ring_phalange_1", "ring_phalange_2", "ring_phalange_3"],
     ]
-    forces = []
-    for s in sensors:
-        fm = s.data.force_matrix_w  # (E, 1, 1, 3) or None
-        if fm is None:
-            forces.append(torch.zeros(env.num_envs, device=env.device))
-            continue
-        # squeeze → (E, 3) → norm
-        forces.append(torch.linalg.norm(fm.view(env.num_envs, 3), dim=-1))
-    force_stack = torch.stack(forces, dim=-1)  # (E, 5)
-    contact_bool = (force_stack > 1.0).float()  # (E, 5) [palm, thumb, idx, mid, ring]
-    num_finger_contacts = contact_bool[:, 1:].sum(dim=-1)  # 4 fingers
-    has_contact = (contact_bool.sum(dim=-1) >= 1).float()  # palm or any finger
+    bucket_forces = []
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    for names in bucket_groups:
+        # Take max ||F|| across all phalange sensors in this bucket.
+        bucket_max = zeros.clone()
+        for name in names:
+            fm = env.scene.sensors[name].data.force_matrix_w  # (E, 1, 1, 3) or None
+            if fm is None:
+                continue
+            f_mag = torch.linalg.norm(fm.view(env.num_envs, 3), dim=-1)  # (E,)
+            bucket_max = torch.maximum(bucket_max, f_mag)
+        bucket_forces.append(bucket_max)
+    force_stack = torch.stack(bucket_forces, dim=-1)         # (E, 5) [palm,t,i,m,r]
+    contact_bool = (force_stack > _CONTACT_FORCE_THRESH).float()
+    num_finger_contacts = contact_bool[:, 1:].sum(dim=-1)    # 4 fingers
+    has_contact = (contact_bool.sum(dim=-1) >= 1).float()    # palm or any finger
 
     # ---- object lift -----------------------------------------------------
     init_z = env._init_object_height  # (E,) scalar per env (same value if a single obj)

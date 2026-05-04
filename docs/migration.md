@@ -409,6 +409,99 @@ future maintainers don't re-discover them:
     hand, which made the imitation tracking term saturate to
     `exp(−10 × large_err)` ≈ 0 within a few steps. We now match the
     ViViDex values exactly in `manager_env_cfg.py`.
+15. **`body_pos_w` / `root_pos_w` are *global* simulation-world
+    coordinates, not env-local.** With `env_spacing=2.5` and a 2×2 grid
+    layout, env 0's origin is `(1.25, -1.25, 0)`, env 2's is
+    `(-1.25, -1.25, 0)`, etc. Subtracting an env-local trajectory
+    target (e.g. `_traj_pregrasp[:, -1, 1:]`) from `body_pos_w` mixes
+    frames and adds a per-env constant offset that grows with
+    `num_envs`. Symptom in our runs: `pregrasp_reward = 1e-11`,
+    `object_track_reward = 0`, and `pregrasp_failure` triggered for
+    every non-env-0 env. Fix: explicitly subtract
+    `env.scene.env_origins` from every world-frame quantity that is
+    later compared against (or fed alongside) trajectory tensors. This
+    affects four call sites:
+
+    - `mdp/rewards.py::_ensure_intermediates` — `finger_pos`,
+      `obj_pos`.
+    - `mdp/observations.py::_gather_links_blockwise` — body link
+      positions used in `robot_state` (so the 22-link block is the
+      same across all parallel envs).
+    - `mdp/observations.py::object_state` — root position (the
+      orientation, linear and angular velocities are translation-
+      invariant and do not need adjustment).
+    - `mdp/observations.py::goal_state` — `palm_pos`, `obj_pos`,
+      `finger_pos` before computing diffs against `_traj_target_pos`
+      (which is already env-local). The intra-env diffs
+      (`palm − obj`, `finger − obj`) are env-origin-invariant either
+      way, but we still subtract for consistency.
+
+    Verified with `/tmp/check_frames.py` (4 envs at stage 0): after
+    the fix, `pre_err`, `obj_com_err` and palm/object env-local
+    coordinates are *bit-identical* across all parallel envs (spread
+    `< 1e-6 m`). Before the fix, envs 2 and 3 saw `pre_err ≈ 1.4 m`
+    instead of `0.28 m`.
+16. **Fingertip kinematic queries must hit the `*_tip` *child* link,
+    not its parent.** ViViDex (`relocate_env.py:75-80, 196`) stores the
+    `(palm + 4 fingertip)` reference points in `robot_jpos[t, :, :]`
+    and compares them to the FK pose of `right_gripper_link_*_tip`,
+    i.e. the `*_tip` child rigid body. With our earlier
+    `merge_fixed_joints=True` choice the `*_tip` collapsed into its
+    parent, so `FINGER_BODY_NAMES` was set to the parent links
+    (`link_15 / 03 / 07 / 11`). After we switched to
+    `merge_fixed_joints=False` for ContactSensor support, the parent
+    links survived but so did the tips, and we forgot to flip the
+    fingertip names back. Net effect: a permanent ~2 cm offset along
+    the distal phalange axis in `pre_err`, `fingertip_err` and the
+    `hand_obj_dense_diff` block of `goal_state`. Verified by reading
+    `pre_err` at frame 0 of the canonical mustard-bottle trajectory:
+    `0.290 m` (parent links) vs `0.268 m` (`*_tip`), exactly the
+    distal-phalange length. Fix: use `right_gripper_link_*_tip` for
+    `FINGER_BODY_NAMES`.
+17. **Per-finger contact buckets need an OR over 3-4 phalanges, not
+    just the tip parent.** ViViDex's
+    `finger_contact_link_names + finger_contact_ids` (relocate_env.py
+    lines 77, 83) defines:
+    - thumb  = `link_15_tip ∪ link_15 ∪ link_14`           (3 links)
+    - index  = `link_03_tip ∪ link_03 ∪ link_02 ∪ link_01` (4 links)
+    - middle = `link_07_tip ∪ link_07 ∪ link_06 ∪ link_05` (4 links)
+    - ring   = `link_11_tip ∪ link_11 ∪ link_10 ∪ link_09` (4 links)
+
+    A contact bucket fires if *any* of its component links registers
+    a non-trivial contact with the object. We previously mounted a
+    single `ContactSensor` per bucket on the parent link (`link_15` /
+    `03` / `07` / `11`), so 12 of the 16 phalange-level contact
+    surfaces (the 4 tips + 8 proximal/middle phalanges) were
+    silently ignored. This systematically under-reported
+    `num_finger_contacts`, dragging the `contact_reward` (`0.5 ×
+    num_finger_contacts`) down by up to a factor of 4.
+
+    PhysX's `create_rigid_contact_view` rejects multi-body sensors
+    paired with a single filter prim (the filter list must satisfy
+    `len(filter) == num_envs × num_bodies`, but our single Object
+    only yields `num_envs`), so the cleanest fix is one
+    `ContactSensorCfg` per phalange — 1 palm + 15 finger links = 16
+    sensors total. The 15 finger sensors are added programmatically
+    in `AllegroRelocateManagerEnvCfg.__post_init__` and named
+    `{thumb,index,middle,ring}_phalange_{0..3}`. The reward code
+    then ORs the 3-4 phalange forces back into 5 buckets in
+    `mdp/rewards.py::_ensure_intermediates` via per-bucket
+    `torch.maximum` + threshold.
+
+    Threshold tuning: ViViDex thresholds the per-step *impulse* at
+    `1e-2 N·s` (`sim_env/base.py:97`); at SAPIEN's `sim_freq=500 Hz`
+    that is an effective *force* of ~5 N. We previously used 1 N
+    (5× too loose). Now bumped to 5 N to match.
+18. **Quaternion order is consistent (no bug found).** Sanity-checked
+    in this audit: the npz `object_orientation` is `wxyz` (first
+    component ≈ 1 for near-identity rotations, confirmed by direct
+    inspection of the mustard-bottle trajectory's frame 0:
+    `[0.99974, -0.0091, 0.0073, 0.0195]`); IsaacLab's
+    `RigidObjectData.root_quat_w` is documented `wxyz`; our hand-
+    rolled `_quat_mul_wxyz` also assumes `wxyz`. The reward's
+    rotation-distance term `2·acos(|⟨q1, q2⟩|)/π` is order-agnostic
+    over the inner product as long as both inputs use the same
+    convention.
 
 ---
 

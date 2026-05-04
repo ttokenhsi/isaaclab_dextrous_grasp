@@ -73,13 +73,33 @@ ROBOT_BODY_NAMES: list[str] = [
 assert len(ROBOT_BODY_NAMES) == 22
 
 PALM_BODY_NAME: str = "right_gripper_palm_link"
-# vividex finger contact buckets (5): palm + thumb tip + index tip + middle tip + ring tip
-# After merge_fixed_joints, the *_tip links collapse into their parent links.
+# Fingertip links used for the kinematic reward terms (``pregrasp_reward`` /
+# ``fingertip_track_reward``) and for the ``hand_obj_dense_diff`` block of
+# ``goal_state``. ViViDex (relocate_env.py:75-80, 196) reads these from the
+# ``*_tip`` *child* links via ``finger_tip_links[i].get_pose().p``, and the
+# pre-processed ``robot_jpos[t, 1:]`` reference targets are stored in the
+# same convention. We must follow suit -- using the parent links shifts the
+# measured fingertip ~2-3 cm proximally and adds a permanent offset to
+# ``pre_err`` / ``fingertip_err``. Order must be [thumb, index, middle, ring]
+# to match the column order of ``robot_jpos``.
 FINGER_BODY_NAMES: list[str] = [
-    "right_gripper_link_15",  # thumb tip parent
-    "right_gripper_link_03",  # index tip parent
-    "right_gripper_link_07",  # middle tip parent
-    "right_gripper_link_11",  # ring tip parent
+    "right_gripper_link_15_tip",  # thumb tip
+    "right_gripper_link_03_tip",  # index tip
+    "right_gripper_link_07_tip",  # middle tip
+    "right_gripper_link_11_tip",  # ring tip
+]
+# Per-finger contact buckets, matching ViViDex's ``finger_contact_link_names``
+# + ``finger_contact_ids`` bincount logic. Each bucket fires if *any* of its
+# 3-4 phalange links registers a non-trivial contact. Order:
+#   bucket 0 (thumb)  = link_15_tip ∪ link_15 ∪ link_14
+#   bucket 1 (index)  = link_03_tip ∪ link_03 ∪ link_02 ∪ link_01
+#   bucket 2 (middle) = link_07_tip ∪ link_07 ∪ link_06 ∪ link_05
+#   bucket 3 (ring)   = link_11_tip ∪ link_11 ∪ link_10 ∪ link_09
+FINGER_CONTACT_BUCKETS: list[list[str]] = [
+    ["right_gripper_link_15_tip", "right_gripper_link_15", "right_gripper_link_14"],
+    ["right_gripper_link_03_tip", "right_gripper_link_03", "right_gripper_link_02", "right_gripper_link_01"],
+    ["right_gripper_link_07_tip", "right_gripper_link_07", "right_gripper_link_06", "right_gripper_link_05"],
+    ["right_gripper_link_11_tip", "right_gripper_link_11", "right_gripper_link_10", "right_gripper_link_09"],
 ]
 
 
@@ -249,7 +269,15 @@ class AllegroRelocateSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
-    # ---- contact sensors (palm + 4 finger groups) --------------------------
+    # ---- contact sensors (palm + 15 finger phalanges) ---------------------
+    # ViViDex's contact buckets are the OR of 3-4 phalange links per finger
+    # (relocate_env.py:77 + sim_env/base.py:97). PhysX's
+    # ``create_rigid_contact_view`` rejects multi-body sensors paired with a
+    # single filter prim (it expects ``len(filter) == num_envs * num_bodies``
+    # but our single Object yields only ``num_envs``). The cleanest workaround
+    # is one sensor per phalange link, each with the single ``Object`` filter.
+    # In :func:`mdp.rewards._ensure_intermediates` we OR the 3-4 phalange
+    # forces back into the corresponding ViViDex bucket.
     palm_contact = ContactSensorCfg(
         prim_path=f"{{ENV_REGEX_NS}}/Robot/{PALM_BODY_NAME}",
         update_period=0.0,
@@ -257,34 +285,9 @@ class AllegroRelocateSceneCfg(InteractiveSceneCfg):
         debug_vis=False,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
     )
-    thumb_contact = ContactSensorCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{FINGER_BODY_NAMES[0]}",
-        update_period=0.0,
-        history_length=1,
-        debug_vis=False,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
-    )
-    index_contact = ContactSensorCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{FINGER_BODY_NAMES[1]}",
-        update_period=0.0,
-        history_length=1,
-        debug_vis=False,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
-    )
-    middle_contact = ContactSensorCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{FINGER_BODY_NAMES[2]}",
-        update_period=0.0,
-        history_length=1,
-        debug_vis=False,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
-    )
-    ring_contact = ContactSensorCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{FINGER_BODY_NAMES[3]}",
-        update_period=0.0,
-        history_length=1,
-        debug_vis=False,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
-    )
+    # The 15 phalange sensors are added programmatically in
+    # ``__post_init__`` below; they are stored as
+    # ``{bucket}_phalange_{idx}`` (e.g. ``thumb_phalange_0``).
 
 
 # ---------------------------------------------------------------------------
@@ -467,3 +470,21 @@ class AllegroRelocateManagerEnvCfg(ManagerBasedRLEnvCfg):
 
         # Propagate object_too_far threshold.
         self.terminations.object_too_far.params = {"threshold": self.reward.obj_com_term}
+
+        # Programmatically attach 1 ContactSensor per phalange link (15 total).
+        # Sensor name convention: ``{bucket}_phalange_{i}``.
+        for bucket_name, links in zip(
+            ["thumb", "index", "middle", "ring"], FINGER_CONTACT_BUCKETS
+        ):
+            for i, link in enumerate(links):
+                setattr(
+                    self.scene,
+                    f"{bucket_name}_phalange_{i}",
+                    ContactSensorCfg(
+                        prim_path=f"{{ENV_REGEX_NS}}/Robot/{link}",
+                        update_period=0.0,
+                        history_length=1,
+                        debug_vis=False,
+                        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+                    ),
+                )

@@ -50,10 +50,15 @@ def _gather_links_blockwise(env: "AllegroRelocateManagerEnv", body_idx: torch.Te
     This matches ViViDex's ``get_robot_state`` ordering exactly:
     ``concatenate([pos.reshape(-1), quat.reshape(-1), lin_vel.reshape(-1), ang_vel.reshape(-1)])``.
     Output shape is ``(E, K * 13)`` for ``K`` bodies.
+
+    Positions are returned in **env-local** frame (= ViViDex's SAPIEN world
+    frame), i.e. with ``env.scene.env_origins`` subtracted, so the values do
+    not depend on which parallel env they came from.
     """
 
     robot = env.scene["robot"]
-    pos = robot.data.body_pos_w[:, body_idx]            # (E, K, 3)
+    env_origins = env.scene.env_origins.unsqueeze(1)     # (E, 1, 3)
+    pos = robot.data.body_pos_w[:, body_idx] - env_origins  # (E, K, 3)
     quat = robot.data.body_quat_w[:, body_idx]           # (E, K, 4)
     lin_vel = robot.data.body_lin_vel_w[:, body_idx]    # (E, K, 3)
     ang_vel = robot.data.body_ang_vel_w[:, body_idx]    # (E, K, 3)
@@ -91,10 +96,16 @@ def robot_state(env: "AllegroRelocateManagerEnv") -> torch.Tensor:
 
 
 def object_state(env: "AllegroRelocateManagerEnv") -> torch.Tensor:
-    """pos(3) + quat(4) + lin_vel(3) + ang_vel(3) = 13."""
+    """pos(3) + quat(4) + lin_vel(3) + ang_vel(3) = 13.
+
+    Position is expressed in env-local frame so it matches the trajectory
+    buffers (``env._traj_obj_t``) and is invariant to which parallel env it
+    came from. Quaternion / velocities are unaffected by env-origin
+    translation.
+    """
 
     obj = env.scene["object"]
-    pos = obj.data.root_pos_w
+    pos = obj.data.root_pos_w - env.scene.env_origins
     quat = obj.data.root_quat_w
     lv = obj.data.root_lin_vel_w
     av = obj.data.root_ang_vel_w
@@ -130,17 +141,24 @@ def goal_state(env: "AllegroRelocateManagerEnv") -> torch.Tensor:
         futures.append(trans)
     traj_goals = torch.cat(futures, dim=-1)  # (E, 21)
 
+    # World-frame quantities are converted to env-local so they line up with
+    # ``env._traj_target_pos`` (which is stored in env-local). The intra-env
+    # diffs (palm − obj, finger − obj) are env-origin-invariant either way,
+    # but we still subtract for readability and so the absolute features are
+    # consistent across envs.
+    env_origins = env.scene.env_origins  # (E, 3)
+
     # ----- palm-obj diff -------------------------------------------------
-    palm_pos = robot.data.body_pos_w[:, env._palm_body_idx]
-    obj_pos = obj.data.root_pos_w
+    palm_pos = robot.data.body_pos_w[:, env._palm_body_idx] - env_origins
+    obj_pos = obj.data.root_pos_w - env_origins
     hand_obj_diff = palm_pos - obj_pos  # (E, 3)
 
     # ----- 4 fingertip-obj diff -----------------------------------------
-    finger_pos = robot.data.body_pos_w[:, env._finger_body_idx]  # (E, 4, 3)
+    finger_pos = robot.data.body_pos_w[:, env._finger_body_idx] - env_origins.unsqueeze(1)  # (E, 4, 3)
     hand_obj_dense_diff = finger_pos - obj_pos.unsqueeze(1)  # (E, 4, 3)
 
     # ----- palm-target & obj-target diff --------------------------------
-    target_pos = env._traj_target_pos  # (E, 3)
+    target_pos = env._traj_target_pos  # (E, 3) -- already env-local
     hand_tgt_diff = palm_pos - target_pos
     obj_tgt_diff = obj_pos - target_pos
 
