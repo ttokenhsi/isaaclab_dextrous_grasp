@@ -1,0 +1,4 @@
+numpy
+scipy
+transforms3d
+gymnasium

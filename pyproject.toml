@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isaaclab_dextrous_grasp"
+version = "0.1.0"
+description = "Standalone IsaacLab port of the ViViDex (SAPIEN) UR5 + Allegro YCB grasp benchmark."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "isaaclab_dextrous_grasp contributors" },
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "transforms3d",
+    "gymnasium",
+]
+
+[project.optional-dependencies]
+# IsaacLab + isaacsim + rsl_rl are expected to be already installed in the
+# `env_isaaclab` conda environment, so we do not list them here.
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["isaaclab_dextrous_grasp*"]
