@@ -5,7 +5,7 @@ Reward structure (per env step, computed pre-/post-pregrasp)::
     if current_step <= pregrasp_steps:
         r_pregrasp = 10 * exp(-10 * mean ||fingertip - pregrasp_target||)
     else:
-        r_contact         = 0.5 * num_finger_contacts
+        r_contact         = 0.5 * num_contacts          # palm + 4 fingers, max 5
         r_object_track    = 10 * exp(-50 * (||obj_pos - tgt|| + 0.1 * obj_rot_err))
         r_fingertip_track = 4  * exp(-10 * mean ||fingertip - ref||)
         r_lift_bonus      = 2.5 if (obj_z - init_object_height > 0.02) else 0
@@ -122,7 +122,11 @@ def _ensure_intermediates(env: "AllegroRelocateManagerEnv") -> dict:
         bucket_forces.append(bucket_max)
     force_stack = torch.stack(bucket_forces, dim=-1)         # (E, 5) [palm,t,i,m,r]
     contact_bool = (force_stack > _CONTACT_FORCE_THRESH).float()
-    num_finger_contacts = contact_bool[:, 1:].sum(dim=-1)    # 4 fingers
+    # ViViDex sums ALL 5 buckets (palm + 4 fingers) in its contact reward; see
+    # ``sum(self.robot_object_contact) * 0.5`` in relocate_env.py:214. We
+    # match that here -- ``num_contacts`` ranges over {0,...,5}.
+    num_contacts = contact_bool.sum(dim=-1)                  # palm + 4 fingers
+    num_finger_contacts = contact_bool[:, 1:].sum(dim=-1)    # 4 fingers (no palm)
     has_contact = (contact_bool.sum(dim=-1) >= 1).float()    # palm or any finger
 
     # ---- object lift -----------------------------------------------------
@@ -136,6 +140,7 @@ def _ensure_intermediates(env: "AllegroRelocateManagerEnv") -> dict:
         "fingertip_err": fingertip_err,
         "obj_com_err": obj_com_err,
         "obj_rot_err": obj_rot_err,
+        "num_contacts": num_contacts,
         "num_finger_contacts": num_finger_contacts,
         "has_contact": has_contact,
         "contact_bool": contact_bool,
@@ -157,8 +162,15 @@ def pregrasp_reward(env: "AllegroRelocateManagerEnv", err_scale: float = 10.0) -
 
 
 def contact_reward(env: "AllegroRelocateManagerEnv") -> torch.Tensor:
+    """``0.5 * (palm + 4 fingers in contact) / 10``.
+
+    Matches ViViDex ``sum(self.robot_object_contact) * 0.5`` which sums all
+    5 buckets including the palm (``relocate_env.py:214``). Per-step max is
+    ``0.5 * 5 / 10 = 0.25``.
+    """
+
     cache = _ensure_intermediates(env)
-    r = 0.5 * cache["num_finger_contacts"]
+    r = 0.5 * cache["num_contacts"]
     return torch.where(cache["in_pregrasp"], torch.zeros_like(r), r) / 10.0
 
 

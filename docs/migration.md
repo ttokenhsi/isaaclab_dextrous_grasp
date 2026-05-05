@@ -122,7 +122,7 @@ sub-components legible.
 | RewTerm                 | weight | ViViDex term                                                                                |
 | ----------------------- | ------ | ------------------------------------------------------------------------------------------- |
 | `pregrasp`              | 1.0    | `10 · exp(-10 · fingertip_err)` while `step ≤ pregrasp_steps`, else 0                       |
-| `contact`               | 0.05   | `0.5 · num_finger_contacts` while `step > pregrasp_steps`, else 0                           |
+| `contact`               | 0.05   | `0.5 · num_contacts` (palm + 4 fingers, max 5) while `step > pregrasp_steps`, else 0        |
 | `object_track`          | 1.0    | `10 · exp(-50 · (com_err + 0.1 · rot_err))` while imitating                                 |
 | `fingertip_track`       | 0.4    | `4 · exp(-10 · fingertip_err)` while imitating                                              |
 | `lift_bonus`            | 0.25   | `2.5 · 1{lift > 0.02}` while imitating                                                      |
@@ -137,12 +137,22 @@ observations always see consistent values for the same physics frame.
 
 ### Contact term in detail
 
-`num_finger_contacts` is the bucket count, exactly as in ViViDex
-(`check_actor_pair_contacts(palm + 4 finger parents, object)`). We obtain
-it from 5 `ContactSensor`s (one per bucket) and threshold the
+`num_contacts` is the bucket count over **palm + 4 fingers**, exactly as
+in ViViDex's `sum(self.robot_object_contact)` where
+`robot_object_contact` is the 5-bucket `bincount` produced by
+`check_actor_pair_contacts(palm + 4 finger parents, object)` (see
+`relocate_env.py:204-214`). Per-env-step max is `5`, so the un-normalised
+contact reward is at most `0.5 · 5 = 2.5` (and `0.25` after the global
+`/10`). We obtain the buckets from 5 `ContactSensor` groups (one per
+bucket, OR-ed across each bucket's phalange links) and threshold the
 `force_matrix_w` magnitude with `impulse_threshold = 1e-2 / dt`. The
 `force_matrix_w` is filtered to a single body per env (`{ENV_REGEX_NS}/Object`)
 which gives a deterministic shape across all envs.
+
+A separate `num_finger_contacts = num_contacts − palm_bucket` is also
+exposed in the cache and consumed by termination logic
+(`lost_contact_in_imitate`), but it is **not** used by the contact
+reward.
 
 ---
 
@@ -246,11 +256,13 @@ We follow IsaacLab's recommended three-step recipe:
    Each has `filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]` so the
    `force_matrix_w` shape is a deterministic `(num_envs, num_bodies, 1, 3)`.
 
-`num_finger_contacts` per env is the count of buckets whose force
-magnitude exceeds `1e-2 / dt`. This is **the** quantity the contact
-reward and the `lost_contact_in_imitate` termination consume, and it is
-formally identical to ViViDex's
-`check_actor_pair_contacts(...)` summed over the four finger buckets.
+`num_contacts` per env is the count of buckets whose force magnitude
+exceeds `1e-2 / dt`, taken over **all 5 buckets (palm + 4 fingers)**.
+This is what the contact reward consumes, matching ViViDex's
+`sum(self.robot_object_contact) * 0.5` (which also includes the palm
+bucket — see `relocate_env.py:214`). The
+`lost_contact_in_imitate` termination instead consumes
+`num_finger_contacts = num_contacts − palm_bucket`.
 
 ---
 
@@ -473,8 +485,8 @@ future maintainers don't re-discover them:
     `03` / `07` / `11`), so 12 of the 16 phalange-level contact
     surfaces (the 4 tips + 8 proximal/middle phalanges) were
     silently ignored. This systematically under-reported
-    `num_finger_contacts`, dragging the `contact_reward` (`0.5 ×
-    num_finger_contacts`) down by up to a factor of 4.
+    `num_contacts`, dragging the `contact_reward` (`0.5 ×
+    num_contacts`) down by up to a factor of 4.
 
     PhysX's `create_rigid_contact_view` rejects multi-body sensors
     paired with a single filter prim (the filter list must satisfy
