@@ -1,602 +1,616 @@
-# ViViDex (SAPIEN) → IsaacLab Migration Notes
+# ViViDex（SAPIEN）→ IsaacLab 迁移说明
 
-This document records the design, alignment and pitfalls of porting the
-[ViViDex](https://github.com/zerchen/vividex_sapien) UR5 + Allegro YCB
-relocate task from SAPIEN to IsaacLab's manager-based RL framework. It is
-intentionally self-contained so that the
-`/root/workspace/rl_grasp/isaaclab_dextrous_grasp` package can be vendored
-without the original `vividex_sapien` repository.
+本文档记录把 [ViViDex](https://github.com/zerchen/vividex_sapien) 的 UR5 +
+Allegro YCB relocate 任务从 SAPIEN 迁移到 IsaacLab 的 manager-based RL
+框架时所做的设计、对齐与踩坑总结。文档刻意写成自包含形式，使
+`/root/workspace/rl_grasp/isaaclab_dextrous_grasp` 这个包脱离原始
+`vividex_sapien` 仓库后仍可独立使用。
 
-The IsaacLab implementation lives in
-`isaaclab_dextrous_grasp/tasks/allegro_relocate/` and is registered with
-`gym.register("Isaac-AllegroUR5-Relocate-v0", ...)`.
-
----
-
-## 1. High-level mapping
-
-| ViViDex / SAPIEN                                                       | IsaacLab equivalent                                                                                  |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `AllegroRelocateRLEnv` (gym + SAPIEN actor system)                     | `AllegroRelocateManagerEnv` ⊂ `ManagerBasedRLEnv`                                                    |
-| YAML / Hydra config (`config/agent/ppo.yaml`)                          | `@configclass` Python configs in `manager_env_cfg.py` + `agents/rsl_rl_ppo_cfg.py`                   |
-| `frame_skip = 10`, `sim_freq = 500`                                    | `decimation = 10`, `sim.dt = 1/200` ⇒ effective 50 Hz control                                        |
-| `compute_inverse_kinematics(...)` w/ damping=0.05 cart limit=1.0       | `IKHandAction` w/ `DifferentialIKController(command_type="velocity")`                                |
-| Palm vel + 16 hand qpos action `(22,)`                                 | `IKHandActionCfg` (palm 6-d + Allegro 16-d) → `articulation.set_joint_position_target`               |
-| 393-dim oracle observation                                             | 4 `ObsTerm` functions concatenated under the `policy` group                                          |
-| Hand-coded reward inside `get_reward`                                  | 7 `RewTerm` (pregrasp / contact / object_track / fingertip_track / lift / ctrl / action)             |
-| `is_done` flags                                                        | 4 `DoneTerm` (`pregrasp_failure`, `object_too_far`, `lost_contact_in_imitate`, `time_out`)           |
-| `reset` rebuilds trajectory via `randomize_trajectories`               | `EventTerm(mode="reset")` → `reset_trajectory_state`                                                 |
-| `check_actor_pair_contacts(palm, finger_parents, object)`              | 5 × `ContactSensorCfg` filtered to `{ENV_REGEX_NS}/Object`                                           |
-| `stable_baselines3.PPO`                                                | `rsl_rl.runners.OnPolicyRunner` (rsl-rl-lib ≥ 5.0.0)                                                 |
-| Single-env stepping × `n_envs` Python procs                            | Vectorised stepping by `InteractiveScene` (`num_envs` envs in one process)                           |
+IsaacLab 实现位于
+`isaaclab_dextrous_grasp/tasks/allegro_relocate/`，已通过
+`gym.register("Isaac-AllegroUR5-Relocate-v0", ...)` 注册。
 
 ---
 
-## 2. Action space (22 dim, `∈ [-1, 1]`)
+## 1. 顶层映射
 
-| Slice | Meaning                                          | ViViDex source                                            |
-| ----- | ------------------------------------------------ | --------------------------------------------------------- |
-| `[0:3]`  | Palm world-frame **linear** velocity command  | `vividex_sapien/.../base.py::compute_inverse_kinematics` |
-| `[3:6]`  | Palm world-frame **angular** velocity command | same                                                      |
-| `[6:22]` | Allegro 16-DoF joint position targets         | `relocate_env.py::pre_step`                               |
+| ViViDex / SAPIEN                                                       | IsaacLab 对应                                                                                       |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `AllegroRelocateRLEnv`（gym + SAPIEN actor 系统）                       | `AllegroRelocateManagerEnv` ⊂ `ManagerBasedRLEnv`                                                   |
+| YAML / Hydra 配置（`config/agent/ppo.yaml`）                            | `manager_env_cfg.py` + `agents/rsl_rl_ppo_cfg.py` 中的 `@configclass` Python 配置                    |
+| `frame_skip = 10`，`sim_freq = 500`                                     | `decimation = 10`，`sim.dt = 1/200` ⇒ 等效 50 Hz 控制                                                |
+| `compute_inverse_kinematics(...)`，damping=0.05，cart limit=1.0          | `IKHandAction` + `DifferentialIKController(command_type="velocity")`                                |
+| 22 维动作 = 掌心速度 + 16 手指 qpos                                      | `IKHandActionCfg`（palm 6 维 + Allegro 16 维）→ `articulation.set_joint_position_target`            |
+| 393 维 oracle observation                                              | `policy` group 下 4 个 `ObsTerm` 拼接                                                                |
+| `get_reward` 中硬编码奖励                                               | 7 个 `RewTerm`（pregrasp / contact / object_track / fingertip_track / lift / ctrl / action）         |
+| `is_done` 标志                                                          | 4 个 `DoneTerm`（`pregrasp_failure`、`object_too_far`、`lost_contact_in_imitate`、`time_out`）       |
+| `reset` 通过 `randomize_trajectories` 重建轨迹                           | `EventTerm(mode="reset")` → `reset_trajectory_state`                                                |
+| `check_actor_pair_contacts(palm, finger_parents, object)`              | 5 个 `ContactSensorCfg`，过滤到 `{ENV_REGEX_NS}/Object`                                              |
+| `stable_baselines3.PPO`                                                | `rsl_rl.runners.OnPolicyRunner`（rsl-rl-lib ≥ 5.0.0）                                                |
+| 单 env 步进 × `n_envs` Python 进程                                       | `InteractiveScene` 向量化步进（同一进程内 `num_envs` 个 env）                                          |
 
-`IKHandAction` (in `mdp/actions.py`) implements ViViDex's velocity-based
-control loop **byte-for-byte** rather than going through IsaacLab's
-`DifferentialIKController` wrapper:
+---
 
-1. **Scale** `[-1, 1]` to physical limits (`cart_lin_vel_limit=1.0`,
-   `cart_ang_vel_limit=1.0`, Allegro per-joint `joint_limits`).
-2. **Solve DLS IK** *once* per outer step in `process_actions`:
+## 2. Action space（22 维，`∈ [-1, 1]`）
 
-       J ∈ ℝ^{6×6}  = jacobian(palm, arm_joints)        # world frame
+| 切片 | 含义                                                | ViViDex 来源                                              |
+| ----- | --------------------------------------------------- | --------------------------------------------------------- |
+| `[0:3]`   | 掌心世界系**线**速度命令                       | `vividex_sapien/.../base.py::compute_inverse_kinematics` |
+| `[3:6]`   | 掌心世界系**角**速度命令                       | 同上                                                      |
+| `[6:22]`  | Allegro 16-DoF 关节位置目标                    | `relocate_env.py::pre_step`                               |
+
+`IKHandAction`（在 `mdp/actions.py`）**逐字节地**实现 ViViDex 基于速度
+的控制循环，刻意没有走 IsaacLab `DifferentialIKController` 包装：
+
+1. **缩放** `[-1, 1]` 到物理上限（`cart_lin_vel_limit=1.0`，
+   `cart_ang_vel_limit=1.0`，Allegro 各关节 `joint_limits`）。
+2. 在 `process_actions` 里**每个外层 step 解一次 DLS IK**：
+
+       J ∈ ℝ^{6×6}  = jacobian(palm, arm_joints)        # 世界系
        arm_qvel     = Jᵀ (J Jᵀ + λ²I)⁻¹ · v_des          # λ = 0.05
        arm_qvel     = clip(arm_qvel, ±π)                 # ViViDex line 168
        arm_qpos_des = arm_qpos + arm_qvel · dt_ctrl
 
-   This is **bit-equivalent** to ViViDex's `get_arm_qvel` (verified to
-   `~1e-7` agreement; see `scripts/test_ik.py` Test B). We deliberately do
-   NOT use `DifferentialIKController` because it would re-solve IK at
-   every PhysX sub-step against a stale pose target, and worse, it has no
-   way to expose the integrated `arm_qvel` that we need for velocity
-   feedforward.
-3. **Apply** *both* targets every PhysX sub-step in `apply_actions`:
+   这与 ViViDex 的 `get_arm_qvel` **位级一致**（已与
+   `~1e-7` 精度对齐，参见 `scripts/test_ik.py` Test B）。我们**故意不**用
+   `DifferentialIKController`：它会在每个 PhysX 子步针对一个过期的
+   pose target 重新解 IK，更糟的是它没有暴露我们做速度前馈所需的
+   `arm_qvel`。
+3. 在 `apply_actions` 里**每个 PhysX 子步同时**写两个目标：
 
        articulation.set_joint_position_target([arm_qpos_des, hand_qpos_des])
        articulation.set_joint_velocity_target([arm_qvel,    0])
 
-   The velocity feedforward is **critical**: without it, the high-`kd`
-   PD gains we copy from ViViDex (arm `kd=40000`) act as a strong brake
-   on the joint velocity and the IK-derived `arm_qpos_des` is never
-   realised. See Pitfall #13.
+   速度前馈是**关键**：缺了它，从 ViViDex 抄来的高 `kd` PD 增益
+   （手臂 `kd=40000`）会作为强阻尼制动到关节速度，IK 推导出的
+   `arm_qpos_des` 永远跟不上。详见踩坑 #13。
 
-Two byproducts are cached on the env for use by reward terms:
+两个副产品被缓存到 env 上供 reward 使用：
 
-- `cartesian_error`: `‖Δpalm − v_des · dt_ctrl‖` per env, updated every
-  sub-step using `step_dt` so the **final** value (after all decimation
-  sub-steps) matches ViViDex's outer-step convention.
-- `target_lin_vel`: the unscaled 3-d palm linear velocity command.
+- `cartesian_error`：每 env 的 `‖Δpalm − v_des · dt_ctrl‖`，每个子步用
+  `step_dt` 更新，使所有 decimation 子步走完后的**最终值**与 ViViDex
+  的"外层 step"约定一致。
+- `target_lin_vel`：未缩放的 3 维掌心线速度命令。
 
-This matches `compute_inverse_kinematics` exactly in geometry (Jacobian
-solve in world frame, identical damping) and timing (one IK solve per
-50 Hz outer step, `decimation=10` PhysX sub-steps).
-
----
-
-## 3. Observation space (393 dim oracle)
-
-All four observation terms live under the `policy` observation group and
-share the same intermediate buffers via the action term and the
-trajectory buffers in `AllegroRelocateManagerEnv`.
-
-| Term                | Dim | Composition                                                                                                                                     |
-| ------------------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `robot_state`       | 330 | qpos (22) + qvel (22) + 22 link states; the 22 links concatenate **block-wise**: 22×3 pos, 22×4 quat, 22×3 lin-vel, 22×3 ang-vel = 286 dims     |
-| `object_state`      | 13  | object pos (3) + quat (4) + lin-vel (3) + ang-vel (3)                                                                                           |
-| `goal_state`        | 42  | next-3-frame `[orn(4) + trans(3)]` = 21 + palm−object diff (3) + 4 fingertip−object diffs (12) + palm−target diff (3) + object−target diff (3)  |
-| `time_state`        | 8   | `[sin(k·t), cos(k·t)]` for `k ∈ {1, 4, 6, 8}`, with `t = traj_step / imitate_steps`                                                             |
-
-`ROBOT_BODY_NAMES` in `manager_env_cfg.py` lists the 22 links the
-ViViDex `joint_link_names` references: 6 arm links
-(`shoulder_link`, `upper_arm_link`, …, `right_gripper_palm_link`) plus the
-16 Allegro distal/medial links. The block-wise flattening (`pos|quat|lv|av`
-across the whole batch) is a critical detail; the older "interleaved"
-flattening of `(pos, quat, lv, av)` per link gave 393 dims as well, **but
-in a different order**, breaking sample efficiency and aligning poorly
-with the loaded ViViDex policies.
-
-The `oracle_state` group is also exposed for the critic via the
-`obs_groups = {"actor": ["policy"], "critic": ["policy"]}` mapping,
-matching the original PPO setup that uses identical observations for
-both networks.
+这与 `compute_inverse_kinematics` 在几何（世界系 Jacobian、相同阻尼）
+和时序（50 Hz 外层步内一次 IK 解、`decimation=10` PhysX 子步）上完全
+一致。
 
 ---
 
-## 4. Reward (matches ViViDex `get_reward / 10`)
+## 3. Observation space（393 维 oracle）
 
-The seven `RewTerm`s are defined in `mdp/rewards.py`. Their per-step
-values are the exact terms from ViViDex's `get_reward`; the global
-`/10` factor is folded into the term `weight`s declared in
-`manager_env_cfg.py`. This way the manager log keeps the reward
-sub-components legible.
+四个 obs term 都挂在 `policy` 这个观测 group 下，通过 action term 和
+`AllegroRelocateManagerEnv` 里的 trajectory buffer 共享中间结果。
 
-| RewTerm                 | weight | ViViDex term                                                                                |
-| ----------------------- | ------ | ------------------------------------------------------------------------------------------- |
-| `pregrasp`              | 1.0    | `10 · exp(-10 · fingertip_err)` while `step ≤ pregrasp_steps`, else 0                       |
-| `contact`               | 0.05   | `0.5 · num_contacts` (palm + 4 fingers, max 5) while `step > pregrasp_steps`, else 0        |
-| `object_track`          | 1.0    | `10 · exp(-50 · (com_err + 0.1 · rot_err))` while imitating                                 |
-| `fingertip_track`       | 0.4    | `4 · exp(-10 · fingertip_err)` while imitating                                              |
-| `lift_bonus`            | 0.25   | `2.5 · 1{lift > 0.02}` while imitating                                                      |
-| `controller_penalty`    | -100.0 | `-1e3 · cartesian_error²`                                                                   |
-| `action_penalty`        | -0.001 | `-0.01 · ∑ clip(qvel, -1, 1)²`                                                              |
+| Term            | Dim | 组成                                                                                                                                                |
+| --------------- | --- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `robot_state`   | 330 | qpos (22) + qvel (22) + 22 个 link 状态；22 link 按**整段拼接**：22×3 pos、22×4 quat、22×3 lin-vel、22×3 ang-vel = 286 维                              |
+| `object_state`  | 13  | object pos (3) + quat (4) + lin-vel (3) + ang-vel (3)                                                                                               |
+| `goal_state`    | 42  | 未来 3 帧 `[orn(4) + trans(3)]` = 21 + palm−object 差 (3) + 4 fingertip−object 差 (12) + palm−target 差 (3) + object−target 差 (3)                     |
+| `time_state`    | 8   | `[sin(k·t), cos(k·t)]`，`k ∈ {1, 4, 6, 8}`，`t = traj_step / imitate_steps`                                                                          |
 
-Intermediates (`com_err`, `rot_err`, `fingertip_err`, palm/finger contact
-booleans, `lift`) are computed once per step in `_ensure_intermediates`
-and cached on the env. The `step()` override in `AllegroRelocateManagerEnv`
-invalidates the cache on each environment step so reward / termination /
-observations always see consistent values for the same physics frame.
+`manager_env_cfg.py` 中的 `ROBOT_BODY_NAMES` 列出了 ViViDex
+`joint_link_names` 引用的 22 个 link：6 条 arm link
+（`shoulder_link`、`upper_arm_link`、…、`right_gripper_palm_link`）+ 16
+个 Allegro 远端／中段 link。**整段式**拼接（先把所有 22 个 pos 接起来，
+再拼所有 22 个 quat，依此类推）是个非常关键的细节；早先按 link 一
+个一个 `(pos, quat, lv, av)` **交错**拼出来也是 393 维，**但顺序不
+一样**，会破坏样本效率，且无法对齐已加载的 ViViDex policy。
 
-### Contact term in detail
-
-`num_contacts` is the bucket count over **palm + 4 fingers**, exactly as
-in ViViDex's `sum(self.robot_object_contact)` where
-`robot_object_contact` is the 5-bucket `bincount` produced by
-`check_actor_pair_contacts(palm + 4 finger parents, object)` (see
-`relocate_env.py:204-214`). Per-env-step max is `5`, so the un-normalised
-contact reward is at most `0.5 · 5 = 2.5` (and `0.25` after the global
-`/10`). We obtain the buckets from 5 `ContactSensor` groups (one per
-bucket, OR-ed across each bucket's phalange links) and threshold the
-`force_matrix_w` magnitude with `impulse_threshold = 1e-2 / dt`. The
-`force_matrix_w` is filtered to a single body per env (`{ENV_REGEX_NS}/Object`)
-which gives a deterministic shape across all envs.
-
-A separate `num_finger_contacts = num_contacts − palm_bucket` is also
-exposed in the cache and consumed by termination logic
-(`lost_contact_in_imitate`), but it is **not** used by the contact
-reward.
+`oracle_state` group 也通过
+`obs_groups = {"actor": ["policy"], "critic": ["policy"]}` 暴露给
+critic，这与 PPO 原版 actor / critic 共用同一观测的设置一致。
 
 ---
 
-## 5. Termination (4 DoneTerms)
+## 4. Reward（与 ViViDex `get_reward / 10` 对齐）
 
-| DoneTerm                  | Condition                                                                                |
+7 个 `RewTerm` 定义在 `mdp/rewards.py`。每步的值与 ViViDex
+`get_reward` 中各项**完全相同**，全局 `/10` 的因子被折叠进
+`manager_env_cfg.py` 中各项的 `weight`。这样 manager 日志就能保留
+reward 各子项的可读性。
+
+| RewTerm                | weight  | ViViDex 项                                                                                  |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `pregrasp`             | 1.0     | `step ≤ pregrasp_steps` 期间 `10 · exp(-10 · fingertip_err)`，否则 0                         |
+| `contact`              | 0.05    | `step > pregrasp_steps` 期间 `0.5 · num_contacts`（palm + 4 指，最多 5），否则 0             |
+| `object_track`         | 1.0     | imitate 期 `10 · exp(-50 · (com_err + 0.1 · rot_err))`                                      |
+| `fingertip_track`      | 0.4     | imitate 期 `4 · exp(-10 · fingertip_err)`                                                    |
+| `lift_bonus`           | 0.25    | imitate 期 `2.5 · 1{lift > 0.02}`                                                            |
+| `controller_penalty`   | -100.0  | `-1e3 · cartesian_error²`                                                                   |
+| `action_penalty`       | -0.001  | `-0.01 · ∑ clip(qvel, -1, 1)²`                                                              |
+
+中间量（`com_err`、`rot_err`、`fingertip_err`、palm/finger 接触
+boolean、`lift`）每步在 `_ensure_intermediates` 计算一次后缓存到 env。
+`AllegroRelocateManagerEnv.step()` override 在每次环境 step 时使
+缓存失效，保证 reward / termination / observation 在同一物理帧上
+看到一致的中间值。
+
+### Contact 项细节
+
+`num_contacts` 是 **palm + 4 fingers** 5 个桶的命中计数，与 ViViDex
+`sum(self.robot_object_contact)` 完全一致；那里
+`robot_object_contact` 由
+`check_actor_pair_contacts(palm + 4 finger parents, object)` 的 5 桶
+`bincount` 产生（参见 `relocate_env.py:204-214`）。每 env 每步最多
+`5`，未归一化的 contact reward 上限 `0.5 · 5 = 2.5`（再除 `/10` 后
+`0.25`）。我们用 5 组 `ContactSensor`（每个桶各一组，桶内多个
+phalange link 的力做 OR）取桶值，并用
+`impulse_threshold = 1e-2 / dt` 去阈值化 `force_matrix_w` 的模长。
+`force_matrix_w` 过滤到每 env 单一 body（`{ENV_REGEX_NS}/Object`），
+确保跨所有 env 输出形状一致。
+
+`num_finger_contacts = num_contacts − palm_bucket` 也单独缓存供
+termination（`lost_contact_in_imitate`）使用，但**不**进入 contact
+reward。
+
+---
+
+## 5. Termination（4 个 DoneTerm）
+
+| DoneTerm                  | 触发条件                                                                                |
 | ------------------------- | ---------------------------------------------------------------------------------------- |
-| `pregrasp_failure`        | `step == pregrasp_steps + 1` and `‖hand_qpos − ref_hand_qpos‖ > 0.05`                    |
+| `pregrasp_failure`        | `step == pregrasp_steps + 1` 且 `‖hand_qpos − ref_hand_qpos‖ > 0.05`                     |
 | `object_too_far`          | `‖object_pos − ref_object_pos‖ > 0.15`                                                   |
-| `lost_contact_in_imitate` | `step > pregrasp_steps` and all 5 contact buckets empty                                  |
-| `time_out`                | `episode_length_buf ≥ max_episode_length` (sets `truncated=True`, not `terminated`)      |
+| `lost_contact_in_imitate` | `step > pregrasp_steps` 且 5 个接触桶全部为空                                            |
+| `time_out`                | `episode_length_buf ≥ max_episode_length`（仅置 `truncated=True`，非 `terminated`）       |
 
-Mirrors `is_done` in `AllegroRelocateRLEnv` exactly. `time_out=True` is
-the IsaacLab way to expose Gymnasium's truncation flag.
-
----
-
-## 6. Events (resets)
-
-`mdp/events.py::reset_trajectory_state` is registered as
-`EventTerm(mode="reset")`. For each env that needs to reset, it:
-
-1. Samples a trajectory id (according to `task.trajectory_names`).
-2. Picks an in-plane offset / yaw rotation according to `task.stage`
-   (0 = canonical, 1 = `(x,y) ∈ U[0.30, 0.40]²`, 2 = +`θ_z ∈ U(-π/12, π/12)`).
-3. Vectorises the trajectory canonicalisation (`object_translation`,
-   `object_orientation`, `robot_jpos`) **identically** to ViViDex's
-   `randomize_trajectories`.
-4. Writes the canonical reference into per-env buffers
-   (`env._traj_object_pos`, `env._traj_robot_qpos`, …).
-5. Resets `current_step / traj_step / pregrasp_failure_pending` counters.
-6. Sets the robot articulation state and the YCB object's root state to
-   the trajectory's t=0 frame.
-
-The buffers themselves are allocated once in
-`AllegroRelocateManagerEnv.load_managers` (see §8), before the parent's
-manager construction, so that the obs/reward/done callbacks find them
-populated when they run their dry-run.
+与 `AllegroRelocateRLEnv.is_done` 完全等价。`time_out=True` 是
+IsaacLab 暴露 Gymnasium `truncation` 标志的标准方式。
 
 ---
 
-## 7. Curriculum (`task.stage`)
+## 6. Events（reset）
 
-Mirrors ViViDex's stages exactly. The rotations are applied to the
-trajectory **and** the object's initial pose in
-`reset_trajectory_state`, so that the hand reference still matches the
-randomised object:
+`mdp/events.py::reset_trajectory_state` 注册为 `EventTerm(mode="reset")`。
+对每个需要重置的 env：
+
+1. 按 `task.trajectory_names` 采样一个轨迹 id。
+2. 按 `task.stage` 采样平面位移 / yaw 旋转
+   （0 = canonical，1 = `(x,y) ∈ U[0.30, 0.40]²`，2 = +`θ_z ∈ U(-π/12, π/12)`）。
+3. 向量化地对轨迹（`object_translation`、`object_orientation`、
+   `robot_jpos`）做 canonicalize，与 ViViDex 的
+   `randomize_trajectories` **完全一致**。
+4. 把 canonical 引用写到每 env buffer
+   （`env._traj_object_pos`、`env._traj_robot_qpos`、…）。
+5. 重置 `current_step / traj_step / pregrasp_failure_pending` 计数器。
+6. 把机器人 articulation state 和 YCB 物体 root state 设为轨迹的 t=0
+   帧。
+
+这些 buffer 本身在 `AllegroRelocateManagerEnv.load_managers`（见 §8）
+中、父类构造 manager 之前，**只分配一次**，使 obs/reward/done
+回调在 dry-run 时就能找到已分配好的 buffer。
+
+---
+
+## 7. 课程（`task.stage`）
+
+完全对齐 ViViDex 的 stage。这些旋转同时作用在轨迹**和**物体的初始
+姿态上（在 `reset_trajectory_state` 内做），保证手部参考与随机化
+后的物体位置一致：
 
 ```
 stage 0 → (x, y, θz) = (0.35, 0.35, 0)
-stage 1 → x, y ∼ U[0.30, 0.40], θz = 0
-stage 2 → x, y ∼ U[0.30, 0.40], θz ∼ U(-π/12, +π/12)
+stage 1 → x, y ∼ U[0.30, 0.40]，θz = 0
+stage 2 → x, y ∼ U[0.30, 0.40]，θz ∼ U(-π/12, +π/12)
 ```
 
 ---
 
-## 8. Custom env override (`AllegroRelocateManagerEnv`)
+## 8. 自定义 env 子类（`AllegroRelocateManagerEnv`）
 
-The default `ManagerBasedRLEnv` is too rigid for two reasons; the
-subclass in `manager_env.py` patches them:
+默认 `ManagerBasedRLEnv` 在两个地方过于刚性，`manager_env.py` 中的
+子类做了补丁：
 
-1. **Object asset is data-driven.** ViViDex picks a YCB object based
-   on the trajectory's `object_name`. We replicate this by **mutating
-   `cfg.scene.object` in `__init__` before calling `super().__init__`**:
-   - Look up the OBJ path under `assets/ycb/<id>/textured_simple.obj`.
-   - Convert to USD via `MeshConverter` (cached in `cache/usd`).
-   - Build a `RigidObjectCfg` with `activate_contact_sensors=True` so the
-     contact sensor pipeline can attach to the object body.
+1. **物体资产数据驱动。** ViViDex 根据轨迹的 `object_name` 选 YCB 物体。
+   我们在 `__init__` 调用 `super().__init__` **之前**动态修改
+   `cfg.scene.object` 来复现：
+   - 在 `assets/ycb/<id>/textured_simple.obj` 下找 OBJ 路径。
+   - 通过 `MeshConverter` 转 USD（`cache/usd` 缓存）。
+   - 构建 `RigidObjectCfg`，并设 `activate_contact_sensors=True`，使
+     contact sensor 管线能挂到物体 body 上。
 
-2. **`ObsTerm` dry-run requires the trajectory buffers up-front.** When
-   IsaacLab's `ObservationManager` is constructed it calls every
-   observation function once with synthetic data to infer shapes. Our
-   `goal_state` reads `env._traj_object_pos[:, env.traj_step + Δ]`, which
-   would crash. We therefore override `load_managers` to:
-   1. Resolve articulation body/joint indices.
-   2. Allocate `_traj_*` and counter buffers with sensible defaults.
-   3. Then call `super().load_managers()`.
+2. **`ObsTerm` dry-run 需要轨迹 buffer 提前就位。** IsaacLab 的
+   `ObservationManager` 构造时会用合成数据各调用一次每个 obs 函数推
+   断 shape；我们的 `goal_state` 会读
+   `env._traj_object_pos[:, env.traj_step + Δ]`，否则崩溃。所以在
+   `load_managers` override 里：
+   1. 先 resolve articulation 的 body / joint index。
+   2. 用合理默认值分配 `_traj_*` 与计数器 buffer。
+   3. 再 `super().load_managers()`。
 
-3. **Per-step bookkeeping**: `step()` is overridden to:
-   - Increment `current_step` and `traj_step` (`min(current_step, T-1)`).
-   - Invalidate the `_intermediate_cache` so reward / termination always
-     re-derive intermediates against the post-step state.
-
----
-
-## 9. Contact sensors
-
-We follow IsaacLab's recommended three-step recipe:
-
-1. **Robot URDF spawn** with `activate_contact_sensors=True` so the
-   `right_gripper_palm_link` and finger parent links expose the
-   contact-reporter API.
-2. **Object spawn** with `activate_contact_sensors=True` so the YCB body
-   counts as a valid contact partner.
-3. **5 `ContactSensorCfg`** in the scene config bound to:
-   - `right_gripper_palm_link` (palm, bucket 0)
-   - `right_gripper_link_15` (thumb parent, bucket 1)
-   - `right_gripper_link_03` (index parent, bucket 2)
-   - `right_gripper_link_07` (middle parent, bucket 3)
-   - `right_gripper_link_11` (ring parent, bucket 4)
-   Each has `filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]` so the
-   `force_matrix_w` shape is a deterministic `(num_envs, num_bodies, 1, 3)`.
-
-`num_contacts` per env is the count of buckets whose force magnitude
-exceeds `1e-2 / dt`, taken over **all 5 buckets (palm + 4 fingers)**.
-This is what the contact reward consumes, matching ViViDex's
-`sum(self.robot_object_contact) * 0.5` (which also includes the palm
-bucket — see `relocate_env.py:214`). The
-`lost_contact_in_imitate` termination instead consumes
-`num_finger_contacts = num_contacts − palm_bucket`.
+3. **每步簿记**：override `step()`：
+   - 递增 `current_step` 与 `traj_step`（`min(current_step, T-1)`）。
+   - 让 `_intermediate_cache` 失效，使 reward / termination 始终基于
+     post-step 状态重新推导中间量。
 
 ---
 
-## 10. PPO config (`agents/rsl_rl_ppo_cfg.py`)
+## 9. Contact sensor
 
-Aligned with `vividex_sapien/algos/rl/config/agent/ppo.yaml`:
+按 IsaacLab 推荐的三步走：
 
-| Field                | ViViDex          | IsaacLab equivalent (rsl-rl 5.x)                              |
-| -------------------- | ---------------- | ------------------------------------------------------------- |
-| `gamma`              | 0.95             | `RslRlPpoAlgorithmCfg.gamma=0.95`                             |
-| `gae_lambda`         | 0.95             | `lam=0.95`                                                    |
-| `learning_rate`      | 1e-5 (fixed)     | `learning_rate=1e-5`, `schedule="fixed"`                      |
-| `ent_coef`           | 0.001            | `entropy_coef=0.001`                                          |
-| `vf_coef`            | 0.5              | `value_loss_coef=0.5`                                         |
-| `clip_range`         | 0.2              | `clip_param=0.2`, `use_clipped_value_loss=True`               |
-| `n_steps` (per env)  | 4096 / num_envs  | `num_steps_per_env=64` (default num_envs=64 ⇒ 4096)           |
-| `batch_size` (mini)  | 256              | `num_mini_batches = (64 × 64) / 256 = 16`                     |
-| `n_epochs`           | 5                | `num_learning_epochs=5`                                       |
-| `net_arch=[256,128]` | actor and critic | `RslRlMLPModelCfg(hidden_dims=[256,128], activation="elu")`   |
-| `log_std_init=-1.6`  | exp(-1.6)≈0.20   | `GaussianDistributionCfg(init_std=0.20, std_type="scalar")`   |
-| `desired_kl=0.01`    | n/a              | early-stopping signal (rsl-rl extra)                          |
-| `max_grad_norm=1.0`  | n/a              | gradient clipping (rsl-rl extra)                              |
+1. **机器人 URDF spawn** 设 `activate_contact_sensors=True`，让
+   `right_gripper_palm_link` 与各手指 parent link 暴露 contact-reporter
+   API。
+2. **物体 spawn** 设 `activate_contact_sensors=True`，让 YCB body 成为
+   有效的 contact partner。
+3. **5 个 `ContactSensorCfg`**，scene cfg 里挂到：
+   - `right_gripper_palm_link`（palm，桶 0）
+   - `right_gripper_link_15`（拇指 parent，桶 1）
+   - `right_gripper_link_03`（食指 parent，桶 2）
+   - `right_gripper_link_07`（中指 parent，桶 3）
+   - `right_gripper_link_11`（无名指 parent，桶 4）
+   每个都带 `filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]`，使
+   `force_matrix_w` 形状是确定的 `(num_envs, num_bodies, 1, 3)`。
 
-For rsl-rl ≥ 5.0.0 the legacy `policy=...` field is gone; we use separate
-`actor: RslRlMLPModelCfg` and `critic: RslRlMLPModelCfg` and the
-`obs_groups={"actor": ["policy"], "critic": ["policy"]}` mapping. The
-config also keeps the deprecated `stochastic`/`init_noise_std`/
-`noise_std_type`/`state_dependent_std` fields populated; IsaacLab's
-`handle_deprecated_rsl_rl_cfg(agent_cfg, version)` will strip them at
-runtime (called from `scripts/train.py` and `scripts/play.py`).
+每 env 的 `num_contacts` 是 5 个桶里**力幅值超 `1e-2 / dt` 阈值**的桶
+个数（**含 palm 桶**），这正是 contact reward 消费的量，与 ViViDex
+`sum(self.robot_object_contact) * 0.5`（同样含 palm 桶，参见
+`relocate_env.py:214`）一致。`lost_contact_in_imitate` 终止则消费
+`num_finger_contacts = num_contacts − palm_bucket`。
 
 ---
 
-## 11. Training scripts
+## 10. PPO 配置（`agents/rsl_rl_ppo_cfg.py`）
 
-- `scripts/train.py`: builds the env + `RslRlVecEnvWrapper` and runs
-  `OnPolicyRunner.learn`. Avoids Hydra; lifts CLI overrides directly so
-  the package stays vendor-friendly.
-- `scripts/play.py`: loads a checkpoint and rolls out
-  `--num_steps` of inference.
-- `scripts/smoke_test.py`: zero-action rollout with shape assertions
-  (`obs == (E, 393)`, `act == (E, 22)`); used as a CI sanity check.
+对齐 `vividex_sapien/algos/rl/config/agent/ppo.yaml`：
 
-All three call `AppLauncher` first, before any IsaacLab / Isaac Sim
-import, which is mandatory for the Omniverse runtime.
+| 字段                  | ViViDex          | IsaacLab 对应（rsl-rl 5.x）                                  |
+| --------------------- | ---------------- | ------------------------------------------------------------- |
+| `gamma`               | 0.95             | `RslRlPpoAlgorithmCfg.gamma=0.95`                             |
+| `gae_lambda`          | 0.95             | `lam=0.95`                                                    |
+| `learning_rate`       | 1e-5（固定）     | `learning_rate=1e-5`，`schedule="fixed"`                      |
+| `ent_coef`            | 0.001            | `entropy_coef=0.001`                                          |
+| `vf_coef`             | 0.5              | `value_loss_coef=0.5`                                         |
+| `clip_range`          | 0.2              | `clip_param=0.2`，`use_clipped_value_loss=True`               |
+| `n_steps`（每 env）   | 4096 / num_envs  | `num_steps_per_env=64`（默认 num_envs=64 ⇒ 4096）             |
+| `batch_size`（mini）  | 256              | `num_mini_batches = (64 × 64) / 256 = 16`                     |
+| `n_epochs`            | 5                | `num_learning_epochs=5`                                       |
+| `net_arch=[256,128]`  | actor 与 critic  | `RslRlMLPModelCfg(hidden_dims=[256,128], activation="elu")`   |
+| `log_std_init=-1.6`   | exp(-1.6)≈0.20   | `GaussianDistributionCfg(init_std=0.20, std_type="scalar")`   |
+| `desired_kl=0.01`     | 无               | early-stopping 信号（rsl-rl 额外）                            |
+| `max_grad_norm=1.0`   | 无               | 梯度裁剪（rsl-rl 额外）                                        |
+
+rsl-rl ≥ 5.0.0 已删除老 `policy=...` 字段；我们改用独立的
+`actor: RslRlMLPModelCfg` 与 `critic: RslRlMLPModelCfg`，配合
+`obs_groups={"actor": ["policy"], "critic": ["policy"]}`。配置里也保留
+了已废弃的 `stochastic`/`init_noise_std`/`noise_std_type`/
+`state_dependent_std` 字段；IsaacLab 的
+`handle_deprecated_rsl_rl_cfg(agent_cfg, version)` 会在运行时
+（`scripts/train.py` 与 `scripts/play.py`）剥掉它们。
 
 ---
 
-## 12. Pitfalls encountered (and how we fixed them)
+## 11. 训练脚本
 
-These caused real failures during the migration; recording them here so
-future maintainers don't re-discover them:
+- `scripts/train.py`：构建 env + `RslRlVecEnvWrapper`，跑
+  `OnPolicyRunner.learn`。不用 Hydra，CLI override 直接拎进来，让本包
+  保持"放进任何项目都能用"的状态。
+- `scripts/play.py`：加载 checkpoint，做 `--num_steps` 步推理 rollout。
+- `scripts/smoke_test.py`：零动作 rollout 加形状断言
+  （`obs == (E, 393)`、`act == (E, 22)`），CI 健康检查用。
 
-1. **URDF mesh names with `.` in the stem confuse PXR's `SdfPath`.**
-   Allegro's `link_0.0.obj` etc. caused
-   `ValueError: Failed to convert MeshConfig`. Fix: rename
-   `*.0.*` → `*_0.*` in `assets/robot/ur5_description/allegro_meshes/`
-   and update the URDF references. Same for the long Robotiq mesh name
-   (`robotiq_ft300-G-062-COUPLING_G-50-4M6-1D6_20181119.STL`) which we
-   collapsed to `robotiq_ft300_coupling.STL`.
-2. **`UrdfConverter` defaults `merge_fixed_joints=True`,** which collapses
-   `right_gripper_palm_link` into its parent during USD conversion. The
-   palm `ContactSensor` then fails with "no rigid bodies under prim".
-   Fix: explicitly set `merge_fixed_joints=False` on the robot's
-   `UrdfFileCfg`. The 4 finger parent links survive either way; the palm
-   is the only one we need this for.
-3. **`activate_contact_sensors` must be set on BOTH spawners.** Robot
-   side enables the reporter API; object side makes the YCB body a valid
-   contact partner. Setting only one side gives "could not find any
-   bodies with contact reporter API" or empty `force_matrix_w` even when
-   contacts visibly happen.
-4. **`filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]`.** Using a global
-   regex (`/World/envs/.*/Object`) returns one `force_matrix_w` per env
-   that aggregates contacts from all envs and triggers the
-   "expected N, found 2" assertion. The per-env regex resolves to
-   exactly one filter body per env and gives a deterministic shape.
-5. **`InteractiveSceneCfg.clone_in_fabric=True` breaks rendering for
-   complex articulations.** PhysX still simulates correctly, but only
-   `env_0` shows up visually. We default to `clone_in_fabric=False`.
-6. **`ManagerBasedRLEnv` instantiation order.** Two consequences:
-   - The object's `RigidObjectCfg` has to be on `cfg.scene` **before**
-     `super().__init__`, hence the dynamic patching in
-     `AllegroRelocateManagerEnv.__init__`.
-   - The `ObsTerm` dry-run runs inside `super().__init__ → load_managers`
-     and tickles every observation function with arbitrary state.
-     `goal_state` reads `env._traj_*`, so we override `load_managers` to
-     allocate those buffers first, then defer to the parent.
-7. **`current_step` per env.** Reward/termination depend on it; we
-   increment in our `step()` override (after PhysX advances, before the
-   manager runs reward / termination terms) and reset in
-   `reset_trajectory_state`.
-8. **Trajectory object name.** The `.npz` files store
-   `object_name="006_mustard_bottle"`. Older code stripped the leading
-   `006_`, breaking the path lookup
-   `assets/ycb/006_mustard_bottle/textured_simple.obj`. We keep the
-   full name (matching the `vividex_sapien/assets/ycb_models` directory
-   layout).
-9. **rsl-rl-lib 5.0.0 dropped `policy=`.** Old IsaacLab examples still
-   ship a `RslRlPpoActorCriticCfg`. Using it raises
-   `KeyError: 'class_name'` deep inside
-   `rsl_rl.algorithms.ppo.construct_algorithm`. The fix is to define
-   `actor`/`critic` as separate `RslRlMLPModelCfg`s and call
-   `handle_deprecated_rsl_rl_cfg` to strip the legacy MISSING fields.
-10. **Block-wise flattening of robot link states.** Initially the 22-link
-    block was flattened as `(pos, quat, lv, av)` per link, which gives
-    393 dims but a different layout from ViViDex. We re-derived the
-    layout from
-    `vividex_sapien/.../base.py::get_oracle_state` and switched to
-    block-wise concatenation (all 22 pos, then all 22 quat, …).
-11. **Robot base pose must mirror `lab.ROBOT2BASE`.** In ViViDex the
-    UR5 is *not* placed at the world origin: every reset calls
-    `self.robot.set_pose(Pose(p=ROBOT2BASE.p + root_offset))` where
-    `ROBOT2BASE.p = (0.765, -0.09, 0)`. The recorded trajectory's
-    `object_translation` and `robot_jpos` are in the same world frame,
-    so canonical `(x, y) = (0.35, 0.35)` is roughly `(-0.42, +0.44)` in
-    the **arm-base** frame. Pinning the robot at `(0, 0, 0)` while
-    keeping the object at `(0.35, 0.35)` puts the arm to the wrong
-    side of the object (arm appears on the left of the object instead
-    of behind / right). Fix: set
+三者都是先调 `AppLauncher`，再做任何 IsaacLab / Isaac Sim 的 import
+——这是 Omniverse 运行时的硬性要求。
+
+---
+
+## 12. 踩坑实录（以及修复方法）
+
+下列问题在迁移过程中实际造成过故障，记录在此让后来人不必重新踩一遍：
+
+1. **URDF mesh 文件名里的 `.` 会让 PXR 的 `SdfPath` 出错。**
+   Allegro 的 `link_0.0.obj` 等文件触发
+   `ValueError: Failed to convert MeshConfig`。修复：把
+   `assets/robot/ur5_description/allegro_meshes/` 下的 `*.0.*` 改名为
+   `*_0.*`，并同步 URDF 里的引用。Robotiq 那个超长名
+   `robotiq_ft300-G-062-COUPLING_G-50-4M6-1D6_20181119.STL` 也压成
+   `robotiq_ft300_coupling.STL`。
+
+2. **`UrdfConverter` 默认 `merge_fixed_joints=True`，** 会在 USD 转换
+   时把 `right_gripper_palm_link` 并入其 parent，于是 palm 上的
+   `ContactSensor` 报 "no rigid bodies under prim"。修复：在机器人
+   `UrdfFileCfg` 上显式设 `merge_fixed_joints=False`。4 个手指 parent
+   link 不论怎么设都在；palm 是唯一需要这个开关的。
+
+3. **`activate_contact_sensors` 必须**两侧都开**。** 机器人侧打开
+   reporter API，物体侧让 YCB body 成为有效 contact partner。只开一
+   侧会报 "could not find any bodies with contact reporter API"，或者
+   即使可见接触也得到空的 `force_matrix_w`。
+
+4. **`filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]`。** 用全局
+   regex（`/World/envs/.*/Object`）会把所有 env 的 contact 聚合成单
+   个 `force_matrix_w`，触发 "expected N, found 2" 断言。每 env 一个
+   regex 解析为单一 filter body，形状才确定。
+
+5. **`InteractiveSceneCfg.clone_in_fabric=True` 让复杂 articulation
+   渲染崩。** PhysX 仿真还是对的，但视觉只有 `env_0` 出现。我们默认
+   `clone_in_fabric=False`。
+
+6. **`ManagerBasedRLEnv` 的实例化顺序。** 两个后果：
+   - 物体的 `RigidObjectCfg` 必须**在 `super().__init__` 之前**写入
+     `cfg.scene`，所以
+     `AllegroRelocateManagerEnv.__init__` 里有动态打 patch 的代码。
+   - `ObsTerm` 的 dry-run 在 `super().__init__ → load_managers` 内
+     运行，会用任意状态触发每个 obs 函数；`goal_state` 读 `env._traj_*`，
+     于是我们 override `load_managers`，先分配 buffer 再交给父类。
+
+7. **每 env 的 `current_step`。** Reward / termination 都依赖它；我们
+   在 `step()` override 里递增（PhysX 步进之后、manager 跑 reward /
+   termination 之前），并在 `reset_trajectory_state` 中重置。
+
+8. **轨迹 object_name。** `.npz` 里存的是
+   `object_name="006_mustard_bottle"`。早先代码把前缀 `006_` 剥掉，
+   导致路径 `assets/ycb/006_mustard_bottle/textured_simple.obj` 找不
+   到。修复：保留完整名（与 `vividex_sapien/assets/ycb_models` 目录
+   布局一致）。
+
+9. **rsl-rl-lib 5.0.0 删了 `policy=`。** 旧 IsaacLab 示例还自带
+   `RslRlPpoActorCriticCfg`，用了它会在
+   `rsl_rl.algorithms.ppo.construct_algorithm` 深处抛
+   `KeyError: 'class_name'`。修法：分开定义 `actor`/`critic` 两个
+   `RslRlMLPModelCfg`，并调用 `handle_deprecated_rsl_rl_cfg` 把残留
+   的 MISSING 字段剥掉。
+
+10. **机器人 link 状态的"整段式"拼接。** 一开始 22 link 的状态按
+    `(pos, quat, lv, av)` 一 link 一 link 拼，得到的也是 393 维但
+    顺序与 ViViDex 不同。我们重新对照
+    `vividex_sapien/.../base.py::get_oracle_state` 推导后改成整段
+    拼接（先所有 22 个 pos，再所有 22 个 quat，依此类推）。
+
+11. **机器人基座位姿必须对齐 `lab.ROBOT2BASE`。** ViViDex 中 UR5
+    *不在*世界原点：每次 reset 都
+    `self.robot.set_pose(Pose(p=ROBOT2BASE.p + root_offset))`，
+    `ROBOT2BASE.p = (0.765, -0.09, 0)`。录制轨迹的
+    `object_translation` 与 `robot_jpos` 在同一世界系下，所以
+    canonical `(x, y) = (0.35, 0.35)` 在**机械臂基座系**里大约是
+    `(-0.42, +0.44)`。把机器人钉死在 `(0, 0, 0)` 同时把物体放在
+    `(0.35, 0.35)`，机械臂就出现在了物体的错误一侧（左侧而非
+    后侧／右侧）。修法：设
     `ArticulationCfg.init_state.pos = ROBOT_BASE_POS = (0.765, -0.09,
-    TABLE_TOP_Z)` and re-centre the table at `(0.5625, 0)` so it
-    spans both robot footprint and object area.
-12. **PhysX `gpu_total_aggregate_pairs_capacity` must scale with
-    `num_envs`.** At 4096 envs PhysX prints
+    TABLE_TOP_Z)`，并把桌子重新摆到 `(0.5625, 0)`，让它同时覆盖
+    机器人脚印与物体区域。
+
+12. **PhysX `gpu_total_aggregate_pairs_capacity` 必须随 `num_envs`
+    放大。** 4096 envs 时 PhysX 会打印
     `The application needs to increase
-    PxGpuDynamicsMemoryConfig::totalAggregatePairsCapacity to ~70k`,
-    after which broad-phase silently misses contacts. The cfg default
-    in `__post_init__` is keyed off the cfg-time `num_envs`, but the
-    user's CLI override happens *after* the cfg is constructed. We
-    therefore recompute the capacity in
-    `AllegroRelocateManagerEnv.__init__` (before `super().__init__`) as
-    `max(16384, 64 × num_envs)`, which gives ~2× headroom over the
-    empirical 17 pairs/env seen at 4096 envs.
-13. **Velocity feedforward in the implicit-PD controller is mandatory.**
-    ViViDex's SAPIEN actor sets *both* `set_drive_target(arm_qpos_des)`
-    and `set_drive_velocity_target(arm_qvel)` before each `step()`, so
-    the joint torque is `kp · (q* − q) + kd · (q̇* − q̇)`. IsaacLab's
-    `DifferentialInverseKinematicsAction` only writes the **position**
-    target; with the high arm `kd = 40000` we have to copy from
-    ViViDex (Pitfall #14), the missing `q̇*` term turns `kd · q̇` into
-    a strong braking torque and the arm ends up tracking only ~17 % of
-    the IK-derived displacement (`scripts/test_ik.py` Test C). We
-    therefore write our own `IKHandAction` that bypasses
-    `DifferentialIKController`: the DLS solve happens once per outer
-    step in `process_actions`, the resulting `(arm_qpos_des, arm_qvel)`
-    are pushed via *both* `set_joint_position_target` and
-    `set_joint_velocity_target` every PhysX sub-step in
-    `apply_actions`, and the `cartesian_error` is updated against
-    `step_dt` (not `physics_dt`) so the post-step value matches
-    ViViDex's outer-step convention.
-14. **PD gains must mirror SAPIEN's `set_drive_property`.** ViViDex
-    sets the arm to `(stiffness=200000, damping=40000,
-    force_limit=500)` and the hand to `(stiffness=200, damping=60,
-    force_limit=10)`. Earlier defaults of `(20000, 400, 300)` and
-    `(damping=10)` were 10–100× too soft for the arm and 6× for the
-    hand, which made the imitation tracking term saturate to
-    `exp(−10 × large_err)` ≈ 0 within a few steps. We now match the
-    ViViDex values exactly in `manager_env_cfg.py`.
-15. **`body_pos_w` / `root_pos_w` are *global* simulation-world
-    coordinates, not env-local.** With `env_spacing=2.5` and a 2×2 grid
-    layout, env 0's origin is `(1.25, -1.25, 0)`, env 2's is
-    `(-1.25, -1.25, 0)`, etc. Subtracting an env-local trajectory
-    target (e.g. `_traj_pregrasp[:, -1, 1:]`) from `body_pos_w` mixes
-    frames and adds a per-env constant offset that grows with
-    `num_envs`. Symptom in our runs: `pregrasp_reward = 1e-11`,
-    `object_track_reward = 0`, and `pregrasp_failure` triggered for
-    every non-env-0 env. Fix: explicitly subtract
-    `env.scene.env_origins` from every world-frame quantity that is
-    later compared against (or fed alongside) trajectory tensors. This
-    affects four call sites:
+    PxGpuDynamicsMemoryConfig::totalAggregatePairsCapacity to ~70k`，
+    之后 broad-phase 会**静默丢失**接触。cfg 在 `__post_init__`
+    里取的是 cfg-time 的 `num_envs`，但用户 CLI override 是在 cfg
+    构造**之后**才发生，所以我们在
+    `AllegroRelocateManagerEnv.__init__`（`super().__init__` 之前）
+    重新算这个容量为 `max(16384, 64 × num_envs)`，给 4096 envs 实测
+    17 pairs/env 留 ~2× 余量。
 
-    - `mdp/rewards.py::_ensure_intermediates` — `finger_pos`,
-      `obj_pos`.
-    - `mdp/observations.py::_gather_links_blockwise` — body link
-      positions used in `robot_state` (so the 22-link block is the
-      same across all parallel envs).
-    - `mdp/observations.py::object_state` — root position (the
-      orientation, linear and angular velocities are translation-
-      invariant and do not need adjustment).
-    - `mdp/observations.py::goal_state` — `palm_pos`, `obj_pos`,
-      `finger_pos` before computing diffs against `_traj_target_pos`
-      (which is already env-local). The intra-env diffs
-      (`palm − obj`, `finger − obj`) are env-origin-invariant either
-      way, but we still subtract for consistency.
+13. **隐式 PD 控制器里**速度前馈是必须的**。** ViViDex 的 SAPIEN
+    actor 在每次 `step()` 前**同时**写
+    `set_drive_target(arm_qpos_des)` 和
+    `set_drive_velocity_target(arm_qvel)`，所以关节力矩是
+    `kp · (q* − q) + kd · (q̇* − q̇)`。IsaacLab 的
+    `DifferentialInverseKinematicsAction` 只写**位置**目标；配上从
+    ViViDex 抄来的高 `kd = 40000`（坑 #14），缺失的 `q̇*` 让
+    `kd · q̇` 直接变成强制动力矩，arm 最终只能跟踪到 IK 推导位移的
+    ~17%（`scripts/test_ik.py` Test C）。我们因此自写
+    `IKHandAction`，绕开 `DifferentialIKController`：
+    `process_actions` 每外层 step 解一次 DLS IK，得到
+    `(arm_qpos_des, arm_qvel)`，`apply_actions` 在每个 PhysX 子步
+    通过 `set_joint_position_target` **和**
+    `set_joint_velocity_target` 同时下发，并按 `step_dt`（不是
+    `physics_dt`）更新 `cartesian_error`，让 step 完后的最终值与
+    ViViDex 外层 step 约定一致。
 
-    Verified with `/tmp/check_frames.py` (4 envs at stage 0): after
-    the fix, `pre_err`, `obj_com_err` and palm/object env-local
-    coordinates are *bit-identical* across all parallel envs (spread
-    `< 1e-6 m`). Before the fix, envs 2 and 3 saw `pre_err ≈ 1.4 m`
-    instead of `0.28 m`.
-16. **Fingertip kinematic queries must hit the `*_tip` *child* link,
-    not its parent.** ViViDex (`relocate_env.py:75-80, 196`) stores the
-    `(palm + 4 fingertip)` reference points in `robot_jpos[t, :, :]`
-    and compares them to the FK pose of `right_gripper_link_*_tip`,
-    i.e. the `*_tip` child rigid body. With our earlier
-    `merge_fixed_joints=True` choice the `*_tip` collapsed into its
-    parent, so `FINGER_BODY_NAMES` was set to the parent links
-    (`link_15 / 03 / 07 / 11`). After we switched to
-    `merge_fixed_joints=False` for ContactSensor support, the parent
-    links survived but so did the tips, and we forgot to flip the
-    fingertip names back. Net effect: a permanent ~2 cm offset along
-    the distal phalange axis in `pre_err`, `fingertip_err` and the
-    `hand_obj_dense_diff` block of `goal_state`. Verified by reading
-    `pre_err` at frame 0 of the canonical mustard-bottle trajectory:
-    `0.290 m` (parent links) vs `0.268 m` (`*_tip`), exactly the
-    distal-phalange length. Fix: use `right_gripper_link_*_tip` for
-    `FINGER_BODY_NAMES`.
-17. **Per-finger contact buckets need an OR over 3-4 phalanges, not
-    just the tip parent.** ViViDex's
-    `finger_contact_link_names + finger_contact_ids` (relocate_env.py
-    lines 77, 83) defines:
-    - thumb  = `link_15_tip ∪ link_15 ∪ link_14`           (3 links)
-    - index  = `link_03_tip ∪ link_03 ∪ link_02 ∪ link_01` (4 links)
-    - middle = `link_07_tip ∪ link_07 ∪ link_06 ∪ link_05` (4 links)
-    - ring   = `link_11_tip ∪ link_11 ∪ link_10 ∪ link_09` (4 links)
+14. **PD 增益必须照搬 SAPIEN 的 `set_drive_property`。** ViViDex
+    手臂为 `(stiffness=200000, damping=40000, force_limit=500)`，
+    手部为 `(stiffness=200, damping=60, force_limit=10)`。先前默认
+    的 `(20000, 400, 300)`、`(damping=10)` 比正确值软了 10–100×（
+    手臂）和 6×（手部），imitation tracking 项几步就饱和到
+    `exp(−10 × large_err)` ≈ 0。现在
+    `manager_env_cfg.py` 里完全照搬 ViViDex 数值。
 
-    A contact bucket fires if *any* of its component links registers
-    a non-trivial contact with the object. We previously mounted a
-    single `ContactSensor` per bucket on the parent link (`link_15` /
-    `03` / `07` / `11`), so 12 of the 16 phalange-level contact
-    surfaces (the 4 tips + 8 proximal/middle phalanges) were
-    silently ignored. This systematically under-reported
-    `num_contacts`, dragging the `contact_reward` (`0.5 ×
-    num_contacts`) down by up to a factor of 4.
+15. **`body_pos_w` / `root_pos_w` 是*全局*仿真世界坐标，不是
+    env-local。** `env_spacing=2.5`、2×2 网格布局下，env 0 原点是
+    `(1.25, -1.25, 0)`，env 2 是 `(-1.25, -1.25, 0)`，依此类推。把
+    env-local 的轨迹目标（如 `_traj_pregrasp[:, -1, 1:]`）从
+    `body_pos_w` 里减出去会**混坐标系**，每 env 多出一个随
+    `num_envs` 增长的常数偏移。我们这边的症状：
+    `pregrasp_reward = 1e-11`、`object_track_reward = 0`，且
+    所有非 env-0 的 env 都触发 `pregrasp_failure`。修法：所有用来
+    与轨迹 tensor 比较（或并列馈送）的世界系量，都显式减
+    `env.scene.env_origins`。涉及四处：
 
-    PhysX's `create_rigid_contact_view` rejects multi-body sensors
-    paired with a single filter prim (the filter list must satisfy
-    `len(filter) == num_envs × num_bodies`, but our single Object
-    only yields `num_envs`), so the cleanest fix is one
-    `ContactSensorCfg` per phalange — 1 palm + 15 finger links = 16
-    sensors total. The 15 finger sensors are added programmatically
-    in `AllegroRelocateManagerEnvCfg.__post_init__` and named
-    `{thumb,index,middle,ring}_phalange_{0..3}`. The reward code
-    then ORs the 3-4 phalange forces back into 5 buckets in
-    `mdp/rewards.py::_ensure_intermediates` via per-bucket
-    `torch.maximum` + threshold.
+    - `mdp/rewards.py::_ensure_intermediates` —— `finger_pos`、
+      `obj_pos`。
+    - `mdp/observations.py::_gather_links_blockwise` —— `robot_state`
+      用的 body link 位置（让 22-link 那段在所有并行 env 里完全一致）。
+    - `mdp/observations.py::object_state` —— root 位置（朝向、线速度、
+      角速度都是平移不变量，无需调整）。
+    - `mdp/observations.py::goal_state` —— 在与 `_traj_target_pos`
+      （已经 env-local）做差之前的 `palm_pos`、`obj_pos`、`finger_pos`。
+      env 内部的差（`palm − obj`、`finger − obj`）本身就 env-origin
+      不变，但仍然减一遍以保持一致。
 
-    Threshold tuning: ViViDex thresholds the per-step *impulse* at
-    `1e-2 N·s` (`sim_env/base.py:97`); at SAPIEN's `sim_freq=500 Hz`
-    that is an effective *force* of ~5 N. We previously used 1 N
-    (5× too loose). Now bumped to 5 N to match.
-18. **Quaternion order is consistent (no bug found).** Sanity-checked
-    in this audit: the npz `object_orientation` is `wxyz` (first
-    component ≈ 1 for near-identity rotations, confirmed by direct
-    inspection of the mustard-bottle trajectory's frame 0:
-    `[0.99974, -0.0091, 0.0073, 0.0195]`); IsaacLab's
-    `RigidObjectData.root_quat_w` is documented `wxyz`; our hand-
-    rolled `_quat_mul_wxyz` also assumes `wxyz`. The reward's
-    rotation-distance term `2·acos(|⟨q1, q2⟩|)/π` is order-agnostic
-    over the inner product as long as both inputs use the same
-    convention.
-19. **Object mass: density-driven, not a fixed 0.2 kg.** ViViDex
-    (`utils/ycb_object_utils.py:118-122`) loads each YCB object with
-    `density=1000 kg/m³` and lets SAPIEN integrate the convex
-    decomposition volume to compute per-object mass. We had instead
-    hard-coded `MassPropertiesCfg(mass=0.2)` in both the
-    `MeshConverter` and the spawn-time `UsdFileCfg` of
-    `manager_env.py::_build_object_cfg`. For the mustard bottle that
-    yields ~0.77 kg now (density × convex-decomp volume) versus
-    0.2 kg before — the old object was about 4× lighter than the
-    real YCB item, which made it visibly fly off on the slightest
-    finger touch and made closing-the-grip impossible (the object
-    accelerated faster than the hand could close).
-    Fix: switch both `MassPropertiesCfg` calls to
-    `MassPropertiesCfg(density=1000.0)` and clear the old YCB USD
-    cache (`cache/usd/ycb/`) so the converter re-bakes mass into the
-    cached USD.
-20. **Robot + object friction must mirror SAPIEN's
-    `(1.5, 1.0)`.** ViViDex sets two materials explicitly:
-    - YCB object: `(static=1.5, dynamic=1.0, restitution=0.1)`
-      (`utils/ycb_object_utils.py:120`).
-    - Robot collision shapes: `(static=1.5, dynamic=1.0,
-      restitution=0.01)` plus `min_patch_radius=0.02`,
-      `patch_radius=0.04` on every link
-      (`utils/common_robot_utils.py:163-168`).
+    用 `/tmp/check_frames.py` 验证（4 envs，stage 0）：修复后
+    `pre_err`、`obj_com_err`、palm/object 的 env-local 坐标在所有并
+    行 env 上**位级一致**（散布 `< 1e-6 m`）。修复前 env 2、3 看到
+    `pre_err ≈ 1.4 m` 而非 `0.28 m`。
 
-    With our previous setup the robot and object inherited PhysX's
-    default `(0.5, 0.5, 0.0)`, i.e. **3× too slippery** for both —
-    the fingers contact the object but cannot generate enough
-    Coulomb friction to lift it. Symptom: policy reaches pregrasp
-    (`pre_err < 0.05`) and closes the fingers, but the object
-    refuses to lift (`obj_lift ≈ 0`).
-    Fix: set
+16. **指尖运动学查询要打 `*_tip` *子* link，不是它的 parent。**
+    ViViDex（`relocate_env.py:75-80, 196`）把 `(palm + 4 fingertip)`
+    参考点存在 `robot_jpos[t, :, :]` 中，与
+    `right_gripper_link_*_tip`（即 `*_tip` 子刚体）的 FK 位姿做比对。
+    早先 `merge_fixed_joints=True` 让 `*_tip` 并入了 parent，
+    `FINGER_BODY_NAMES` 因此设成了 parent link
+    （`link_15 / 03 / 07 / 11`）。后来为支持 ContactSensor 切到
+    `merge_fixed_joints=False` 之后，parent link 还在，但 tip 也活
+    回来了，而我们忘了把指尖名字切回去。结果：`pre_err`、
+    `fingertip_err` 与 `goal_state` 的 `hand_obj_dense_diff` 段沿
+    远端 phalange 轴永久地差了 ~2 cm。验证：读 mustard 轨迹第 0 帧
+    canonical 状态下的 `pre_err`：`0.290 m`（parent link）vs
+    `0.268 m`（`*_tip`），刚好等于远端 phalange 长度。修法：
+    `FINGER_BODY_NAMES` 改用 `right_gripper_link_*_tip`。
+
+17. **每指 contact 桶要对 3-4 个 phalange 做 OR，仅 tip-parent 不
+    够。** ViViDex 的
+    `finger_contact_link_names + finger_contact_ids`
+    （`relocate_env.py` 行 77、83）定义：
+    - 拇指  = `link_15_tip ∪ link_15 ∪ link_14`           （3 个 link）
+    - 食指  = `link_03_tip ∪ link_03 ∪ link_02 ∪ link_01` （4 个 link）
+    - 中指  = `link_07_tip ∪ link_07 ∪ link_06 ∪ link_05` （4 个 link）
+    - 无名指 = `link_11_tip ∪ link_11 ∪ link_10 ∪ link_09` （4 个 link）
+
+    任何一个组成 link 与物体有非平凡接触，桶就触发。我们之前每个
+    桶只在 parent link（`link_15` / `03` / `07` / `11`）挂了一个
+    `ContactSensor`，于是 16 个 phalange 级接触面里有 12 个（4 个
+    tip + 8 个近端 / 中段 phalange）被静默忽略了。这系统性地低估
+    `num_contacts`，把 `contact_reward`（`0.5 × num_contacts`）压
+    到正确值的 1/4 之多。
+
+    PhysX 的 `create_rigid_contact_view` 不接受多 body sensor 配
+    单 filter prim（filter list 必须满足
+    `len(filter) == num_envs × num_bodies`，但单个 Object 只产生
+    `num_envs` 个），所以最干净的修法是每 phalange 一个
+    `ContactSensorCfg`：1 palm + 15 finger link = 16 个 sensor。
+    这 15 个 finger sensor 在
+    `AllegroRelocateManagerEnvCfg.__post_init__` 里编程式添加，命名
+    `{thumb,index,middle,ring}_phalange_{0..3}`。reward 代码再在
+    `mdp/rewards.py::_ensure_intermediates` 中按桶用 `torch.maximum`
+    做 OR 还原成 5 桶并阈值化。
+
+    阈值调整：ViViDex 阈值化的是每步**冲量**，
+    `1e-2 N·s`（`sim_env/base.py:97`）；在 SAPIEN `sim_freq=500 Hz`
+    下相当于约 5 N 的有效**力**。我们之前用 1 N（松了 5 倍），现已
+    调到 5 N。
+
+18. **四元数顺序一致（无 bug）。** 本轮审计中确认：npz 的
+    `object_orientation` 是 `wxyz`（近单位旋转时第 0 分量 ≈ 1，已
+    用 mustard-bottle 第 0 帧
+    `[0.99974, -0.0091, 0.0073, 0.0195]` 直接验证）；IsaacLab 文档
+    里 `RigidObjectData.root_quat_w` 也是 `wxyz`；自写的
+    `_quat_mul_wxyz` 同样按 `wxyz` 处理。reward 中的旋转距离项
+    `2·acos(|⟨q1, q2⟩|)/π` 只要两边惯例一致，对内积顺序无关。
+
+19. **物体质量：density 驱动，不是固定 0.2 kg。** ViViDex
+    （`utils/ycb_object_utils.py:118-122`）每个 YCB 物体加载时
+    `density=1000 kg/m³`，让 SAPIEN 对凸分解体积积分得到每个物体
+    的质量。我们之前在 `manager_env.py::_build_object_cfg` 的
+    `MeshConverter` 与 spawn 时的 `UsdFileCfg` 里都硬写
+    `MassPropertiesCfg(mass=0.2)`。mustard bottle 现在算出来约
+    0.77 kg（density × 凸分解体积），先前的 0.2 kg 比真实 YCB 物体
+    轻了约 4×，导致它一被指尖碰就明显飞起、合拢手指根本来不及（
+    物体加速度比手指闭合还快）。
+    修法：两处 `MassPropertiesCfg` 都换成
+    `MassPropertiesCfg(density=1000.0)`，并清掉旧的 YCB USD 缓存
+    （`cache/usd/ycb/`），让转换器重新把 mass 烘进缓存 USD。
+
+20. **机器人 + 物体摩擦必须对齐 SAPIEN 的 `(1.5, 1.0)`。** ViViDex
+    显式设置两个材料：
+    - YCB 物体：`(static=1.5, dynamic=1.0, restitution=0.1)`
+      （`utils/ycb_object_utils.py:120`）。
+    - 机器人 collision shape：`(static=1.5, dynamic=1.0,
+      restitution=0.01)` + 每个 link `min_patch_radius=0.02`、
+      `patch_radius=0.04`（`utils/common_robot_utils.py:163-168`）。
+
+    我们之前的设置下机器人和物体都继承 PhysX 默认
+    `(0.5, 0.5, 0.0)`——**两边都滑了 3×**，手指能碰到物体却生不出
+    足够 Coulomb 摩擦把它抬起。症状：policy 走到 pregrasp
+    （`pre_err < 0.05`）、合拢手指，但物体死活不抬（`obj_lift ≈ 0`）。
+    修法：在 env `__post_init__` 里设
     `cfg.sim.physics_material =
        RigidBodyMaterialCfg(static_friction=1.5,
                             dynamic_friction=1.0,
-                            restitution=0.0)`
-    in the env's `__post_init__`, which becomes the default for any
-    rigid body that does not have its own physics material binding.
-    The table keeps its own explicit override
-    `(1.0, 0.5, 0.01)` to match `sim_env/relocate_env.py:98`.
+                            restitution=0.0)`，
+    它会成为任何**没有自带物理材料绑定**的刚体的默认值。桌子保留
+    自己的 `(1.0, 0.5, 0.01)` override，对应
+    `sim_env/relocate_env.py:98`。
 
-    Verified with `/tmp/check_physics.py`: object mass at runtime is
-    `0.7678 kg` (was `0.2 kg`) and `cfg.sim.physics_material` reports
-    `(1.5, 1.0, 0.0)`.
+    用 `/tmp/check_physics.py` 验证：运行时物体质量 `0.7678 kg`
+    （之前 `0.2 kg`），`cfg.sim.physics_material` 报告
+    `(1.5, 1.0, 0.0)`。
 
 ---
 
-## 13. External usage
+## 13. TensorBoard 诊断指标
 
-To use this package from another project:
+`AllegroRelocateManagerEnv.step()` 每步将 ViViDex 风格的诊断标量
+写入 `extras["log"]["Metrics/<name>"]`。rsl_rl 的 logger 会在每个 PPO
+iteration 里把它们沿 rollout 步求均值，最终落到 TensorBoard 的
+`Metrics/` 分组下：
+
+| TB 名称                       | 含义                                  | 对应 ViViDex 字段     |
+| ----------------------------- | ------------------------------------- | --------------------- |
+| `Metrics/control_error`       | DLS-IK Cartesian 残差（m）            | `control_error`       |
+| `Metrics/hand_jpos_err`       | pregrasp 期 fingertip L2 误差（m）    | `hand_jpos_err`       |
+| `Metrics/hand_mjpos_err`      | imitate 期 fingertip L2 误差（m）     | `hand_mjpos_err`      |
+| `Metrics/obj_com_err`         | 物体 COM 跟踪误差（m）                | `obj_com_err`         |
+| `Metrics/obj_rot_err`         | 物体旋转误差（归一化到 [0, 1]）       | （隐含在 reward 里）  |
+| `Metrics/obj_lift`            | 物体相对初始高度的抬升量（m, ≥0）     | `obj_lift`            |
+| `Metrics/num_finger_contacts` | 4 指中正在接触物体的桶数（max 4）     | （隐含在 reward 里）  |
+| `Metrics/pregrasp_success`    | 各 env `_pregrasp_success` 的均值     | `pregrasp_success`    |
+| `Metrics/imitate_steps`       | 每 env imitate 总步数（stage 0/1 恒值）| `imitate_steps`       |
+| `Metrics/stage`               | 课程 stage（0/1/2）                   | `stage`               |
+
+聚合粒度：`Metrics/X` 是 **per-step 各 env 均值再沿 rollout 求均值**
+（与 `Episode_Reward/*` 沿 episode 求和后求均值的口径不同）。
+
+---
+
+## 14. 外部使用
+
+要在其它项目里用本包：
 
 ```bash
 pip install -e /root/workspace/rl_grasp/isaaclab_dextrous_grasp
 ```
 
-Then:
+然后：
 
 ```python
 import gymnasium as gym
-import isaaclab_dextrous_grasp  # registers the gym ID
+import isaaclab_dextrous_grasp  # 注册 gym ID
 
 env = gym.make("Isaac-AllegroUR5-Relocate-v0", cfg=env_cfg)
 ```
 
-The env follows the standard IsaacLab manager-based contract, so it
-plugs into any third-party `RslRlVecEnvWrapper` /
-`RslRlOnPolicyRunnerCfg` workflow.
+env 遵守标准 IsaacLab manager-based 协议，可直接接入任何第三方
+`RslRlVecEnvWrapper` / `RslRlOnPolicyRunnerCfg` 流水线。
 
 ---
 
-## 14. Verification checklist
+## 15. 验证清单
 
-Run these commands in the `env_isaaclab` conda environment:
+在 `env_isaaclab` conda 环境中跑下列命令：
 
 ```bash
-# 1. Sanity-check shapes and a 20-step zero-action rollout
+# 1. 形状健康检查 + 20 步零动作 rollout
 python scripts/smoke_test.py --num_envs 4 --headless
 
-# 2. End-to-end PPO learn iteration
+# 2. 端到端 PPO 单 iteration
 python scripts/train.py \
     --task Isaac-AllegroUR5-Relocate-v0 \
     --num_envs 64 --headless --max_iterations 1
 ```
 
-A successful pass prints `obs.shape == (4, 393)`, `act dims == 22`, and
-the rsl-rl runner banner with `Mean action std: 0.20` for iteration 0.
+通过的话会打印 `obs.shape == (4, 393)`、`act dims == 22`，以及
+rsl-rl runner banner 的 `Mean action std: 0.20`（iteration 0）。
+
+---
+
+## 16. 轨迹可视化
+
+`scripts/visualize_trajectory.py` 用 headless 模式把任意一条
+trajectory 录成 MP4：
+
+- 物体每一控制步被运动学地"瞬移"到目标位姿
+- 6 个 sphere marker 显示每帧目标 palm + 4 fingertip + 物体目标位置
+- 机器人保持复位时的 pregrasp 初始姿态
+
+```bash
+python scripts/visualize_trajectory.py \
+    --trajectory ycb-006_mustard_bottle-20200709-subject-01-20200709_143211 \
+    --num_steps 75 --video_dir /tmp/traj_vis \
+    --cam_eye 0.59 0.09 0.29 --cam_lookat 0.35 0.35 0.12
+```
+
+`--cam_eye` / `--cam_lookat` 用 env-local 坐标，方便就近看抓取细节。

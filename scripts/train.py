@@ -51,6 +51,34 @@ parser.add_argument(
     default=2000,
     help="Number of env steps between video recordings.",
 )
+parser.add_argument(
+    "--video_cam_eye",
+    type=float,
+    nargs=3,
+    default=[2.0, 2.0, 2.0],
+    metavar=("X", "Y", "Z"),
+    help=(
+        "Recording camera eye, in env-local frame (m). Default keeps IsaacLab's "
+        "(1,1,1) isometric direction but at ~3.5 m distance instead of the "
+        "stock (7.5,7.5,7.5) which is ~13 m away."
+    ),
+)
+parser.add_argument(
+    "--video_cam_lookat",
+    type=float,
+    nargs=3,
+    default=[0.0, 0.0, 0.0],
+    metavar=("X", "Y", "Z"),
+    help="Recording camera lookat, in env-local frame (m). Default = env origin.",
+)
+parser.add_argument(
+    "--video_resolution",
+    type=int,
+    nargs=2,
+    default=[1280, 720],
+    metavar=("W", "H"),
+    help="Recorded video resolution.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -90,6 +118,15 @@ def main() -> None:
     if args_cli.trajectory is not None:
         env_cfg.task.trajectory_name = args_cli.trajectory
     env_cfg.seed = args_cli.seed
+
+    # Override the recording camera to a close-up over env 0's tabletop so the
+    # video focuses on the actual grasp instead of the wide simulation scene.
+    if args_cli.video:
+        env_cfg.viewer.eye = tuple(args_cli.video_cam_eye)
+        env_cfg.viewer.lookat = tuple(args_cli.video_cam_lookat)
+        env_cfg.viewer.origin_type = "env"
+        env_cfg.viewer.env_index = 0
+        env_cfg.viewer.resolution = tuple(args_cli.video_resolution)
 
     agent_cfg = AllegroUR5RelocatePPORunnerCfg()
     agent_cfg.seed = args_cli.seed

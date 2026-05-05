@@ -59,8 +59,15 @@ def reset_trajectory_state(
     env._traj_step[env_ids] = 0
     env._pregrasp_success[env_ids] = False
 
-    # ---- 4) reset intermediate cache & cartesian error -----------------
-    env._reward_cache = None
+    # ---- 4) reset cartesian error --------------------------------------
+    # NOTE: do NOT touch ``env._reward_cache`` here. Reset events fire
+    # *inside* ``super().step()`` (between reward.compute and the parent
+    # returning), but ``manager_env.step`` reads the cache *after* the parent
+    # returns to populate ``Metrics/`` in extras["log"]. Wiping the cache here
+    # caused those metrics (hand_jpos_err, obj_lift, num_finger_contacts, ...)
+    # to disappear from TensorBoard the moment any env in a rollout time-outs.
+    # The cache is unconditionally invalidated at the end of ``manager_env.step``
+    # so a stale cache will never leak into the next physics step.
     if hasattr(env, "_cartesian_error") and env._cartesian_error is not None:
         env._cartesian_error[env_ids] = 0.0
 

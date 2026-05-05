@@ -112,9 +112,62 @@ class AllegroRelocateManagerEnv(ManagerBasedRLEnv):
             at_boundary = self.current_step == self._pregrasp_steps
             success_now = at_boundary & (~self._pregrasp_success) & (cache["pre_err"] < 0.05)
             self._pregrasp_success = self._pregrasp_success | success_now
+        # Mirror vividex's diagnostic /info logs so they show up in TensorBoard.
+        # rsl_rl's logger averages every key in extras["log"] across rollout steps
+        # within an iteration, so writing per-step means here yields per-iteration
+        # mean metrics under the ``Metrics/`` group.
+        self._populate_metrics_log()
         # Invalidate the intermediates cache so the next step recomputes.
         self._reward_cache = None
         return ret
+
+    def _populate_metrics_log(self) -> None:
+        """Append vividex-style per-step diagnostic scalars to extras['log'].
+
+        These keys mirror the ones vividex prints in its training table:
+
+        * ``control_error``       -- DLS-IK Cartesian residual (m)
+        * ``hand_jpos_err``       -- pre-grasp fingertip L2 error (m)
+        * ``hand_mjpos_err``      -- imitate fingertip L2 error (m)
+        * ``obj_com_err``         -- object COM tracking error (m)
+        * ``obj_lift``            -- object height above init (m, clamped >=0)
+        * ``pregrasp_success``    -- mean cumulative success bool across envs
+        * ``imitate_steps``       -- per-env imitate horizon (constant in stages 0/1)
+        * ``stage``               -- curriculum stage int (0/1/2)
+
+        All values are scalars (mean across envs).  rsl_rl will then average
+        them across rollout steps to produce one TB scalar per iteration.
+        """
+
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+        log = self.extras["log"]
+
+        cache = getattr(self, "_reward_cache", None)
+        if cache is not None:
+            log["Metrics/hand_jpos_err"] = cache["pre_err"].mean()
+            log["Metrics/hand_mjpos_err"] = cache["fingertip_err"].mean()
+            log["Metrics/obj_com_err"] = cache["obj_com_err"].mean()
+            log["Metrics/obj_rot_err"] = cache["obj_rot_err"].mean()
+            log["Metrics/obj_lift"] = cache["obj_lift"].mean()
+            log["Metrics/num_finger_contacts"] = cache["num_finger_contacts"].mean()
+
+        ce = getattr(self, "_cartesian_error", None)
+        if ce is not None:
+            log["Metrics/control_error"] = ce.mean()
+
+        if hasattr(self, "_pregrasp_success"):
+            log["Metrics/pregrasp_success"] = self._pregrasp_success.float().mean()
+
+        if hasattr(self, "_imitate_steps"):
+            log["Metrics/imitate_steps"] = self._imitate_steps.float().mean()
+
+        # Stage is a static cfg int; cast to tensor for uniform tensor handling.
+        try:
+            stage = float(self.cfg.task.stage)
+            log["Metrics/stage"] = torch.tensor(stage, device=self.device)
+        except (AttributeError, TypeError):
+            pass
 
     # ------------------------------------------------------------------
     # Helpers

@@ -38,7 +38,7 @@ class AllegroUR5RelocatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO runner cfg matching vividex's hyper-parameters."""
 
     seed: int = 42
-    num_steps_per_env: int = 64
+    num_steps_per_env: int = 24
     """4096 / 64 envs = 64 steps each → matches vividex ``n_steps=4096``."""
 
     max_iterations: int = 5000
@@ -57,12 +57,12 @@ class AllegroUR5RelocatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         obs_normalization=False,
         distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(
-            init_std=0.20,  # ≈ exp(-1.6)
+            init_std=0.3,  # ≈ exp(-1.6)
             std_type="scalar",
         ),
         # Suppress deprecated MISSING fields.
         stochastic=True,
-        init_noise_std=0.20,
+        init_noise_std=0.3,
         noise_std_type="scalar",
         state_dependent_std=False,
     )
@@ -84,11 +84,11 @@ class AllegroUR5RelocatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         clip_param=0.2,
         entropy_coef=0.005,
         num_learning_epochs=5,
-        num_mini_batches=16,
+        num_mini_batches=4,
         learning_rate=1.0e-5,
-        schedule="fixed",
+        schedule="adaptive",
         gamma=0.95,
         lam=0.95,
-        desired_kl=0.01,
+        desired_kl=0.02,
         max_grad_norm=1.0,
     )
