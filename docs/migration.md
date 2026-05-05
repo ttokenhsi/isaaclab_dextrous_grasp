@@ -502,6 +502,50 @@ future maintainers don't re-discover them:
     rotation-distance term `2·acos(|⟨q1, q2⟩|)/π` is order-agnostic
     over the inner product as long as both inputs use the same
     convention.
+19. **Object mass: density-driven, not a fixed 0.2 kg.** ViViDex
+    (`utils/ycb_object_utils.py:118-122`) loads each YCB object with
+    `density=1000 kg/m³` and lets SAPIEN integrate the convex
+    decomposition volume to compute per-object mass. We had instead
+    hard-coded `MassPropertiesCfg(mass=0.2)` in both the
+    `MeshConverter` and the spawn-time `UsdFileCfg` of
+    `manager_env.py::_build_object_cfg`. For the mustard bottle that
+    yields ~0.77 kg now (density × convex-decomp volume) versus
+    0.2 kg before — the old object was about 4× lighter than the
+    real YCB item, which made it visibly fly off on the slightest
+    finger touch and made closing-the-grip impossible (the object
+    accelerated faster than the hand could close).
+    Fix: switch both `MassPropertiesCfg` calls to
+    `MassPropertiesCfg(density=1000.0)` and clear the old YCB USD
+    cache (`cache/usd/ycb/`) so the converter re-bakes mass into the
+    cached USD.
+20. **Robot + object friction must mirror SAPIEN's
+    `(1.5, 1.0)`.** ViViDex sets two materials explicitly:
+    - YCB object: `(static=1.5, dynamic=1.0, restitution=0.1)`
+      (`utils/ycb_object_utils.py:120`).
+    - Robot collision shapes: `(static=1.5, dynamic=1.0,
+      restitution=0.01)` plus `min_patch_radius=0.02`,
+      `patch_radius=0.04` on every link
+      (`utils/common_robot_utils.py:163-168`).
+
+    With our previous setup the robot and object inherited PhysX's
+    default `(0.5, 0.5, 0.0)`, i.e. **3× too slippery** for both —
+    the fingers contact the object but cannot generate enough
+    Coulomb friction to lift it. Symptom: policy reaches pregrasp
+    (`pre_err < 0.05`) and closes the fingers, but the object
+    refuses to lift (`obj_lift ≈ 0`).
+    Fix: set
+    `cfg.sim.physics_material =
+       RigidBodyMaterialCfg(static_friction=1.5,
+                            dynamic_friction=1.0,
+                            restitution=0.0)`
+    in the env's `__post_init__`, which becomes the default for any
+    rigid body that does not have its own physics material binding.
+    The table keeps its own explicit override
+    `(1.0, 0.5, 0.01)` to match `sim_env/relocate_env.py:98`.
+
+    Verified with `/tmp/check_physics.py`: object mass at runtime is
+    `0.7678 kg` (was `0.2 kg`) and `cfg.sim.physics_material` reports
+    `(1.5, 1.0, 0.0)`.
 
 ---
 

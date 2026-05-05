@@ -445,6 +445,22 @@ class AllegroRelocateManagerEnvCfg(ManagerBasedRLEnvCfg):
         )
         self.sim.physx.friction_correlation_distance = 0.00625
 
+        # Default physics material for everything that does not have its own
+        # explicit material (i.e. the robot and the YCB object). Mirrors
+        # ViViDex's robot + object material:
+        #   ``scene.engine.create_physical_material(1.5, 1.0, 0.01)``
+        # (`utils/common_robot_utils.py:163`) and the YCB material
+        # ``(1.5, 1.0, 0.1)`` (`utils/ycb_object_utils.py:120`). The two
+        # materials only differ in restitution (0.01 vs 0.1) which is
+        # negligible for a grasping task -- low restitution is actually
+        # preferable since it reduces bounce off the fingers. The table
+        # has its own material override (1.0, 0.5, 0.01).
+        self.sim.physics_material = sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.5,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        )
+
         # Build the robot cfg (object cfg is built lazily in
         # AllegroRelocateManagerEnv.__init__ once the trajectory is loaded).
         self.scene.robot = _build_robot_cfg()
