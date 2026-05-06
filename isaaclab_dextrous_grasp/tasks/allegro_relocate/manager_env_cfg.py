@@ -261,7 +261,7 @@ class AllegroRelocateSceneCfg(InteractiveSceneCfg):
     plane = AssetBaseCfg(
         prim_path="/World/GroundPlane",
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -1.5)),
-        spawn=GroundPlaneCfg(),
+        spawn=GroundPlaneCfg(size=(500.0, 500.0)),
     )
 
     light = AssetBaseCfg(

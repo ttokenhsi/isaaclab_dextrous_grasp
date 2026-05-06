@@ -57,12 +57,12 @@ class AllegroUR5RelocatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         obs_normalization=False,
         distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(
-            init_std=0.3,  # ≈ exp(-1.6)
+            init_std=0.2,  # ≈ exp(-1.6)
             std_type="scalar",
         ),
         # Suppress deprecated MISSING fields.
         stochastic=True,
-        init_noise_std=0.3,
+        init_noise_std=0.2,
         noise_std_type="scalar",
         state_dependent_std=False,
     )
