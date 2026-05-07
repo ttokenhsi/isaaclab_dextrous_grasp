@@ -53,17 +53,26 @@ parser.add_argument(
     "--cam_eye",
     type=float,
     nargs=3,
-    default=[0.59, 0.09, 0.29],
+    default=[1.00, 0.95, 0.55],
     metavar=("X", "Y", "Z"),
-    help="Camera eye position (env-local frame, meters).",
+    help=(
+        "Camera eye position (env-local frame, meters). Default sits ``NE`` "
+        "of the canonical object pose (0.35, 0.35) at ``55 cm`` above the "
+        "table -- same family as ``train.py``'s recording cam, so the "
+        "robot+object share the frame at a natural ~30° downward angle."
+    ),
 )
 parser.add_argument(
     "--cam_lookat",
     type=float,
     nargs=3,
-    default=[0.35, 0.35, 0.12],
+    default=[0.35, 0.35, 0.05],
     metavar=("X", "Y", "Z"),
-    help="Camera target position (env-local frame, meters).",
+    help=(
+        "Camera target position (env-local frame, meters). Default ``z=0.05`` "
+        "is intentionally low so flat objects (banana, plate, ...) sit in "
+        "the centre of frame instead of being clipped against the table edge."
+    ),
 )
 parser.add_argument(
     "--cam_resolution",
@@ -100,9 +109,19 @@ from isaaclab_dextrous_grasp.tasks.allegro_relocate.manager_env_cfg import (
 
 
 def _make_marker_cfg() -> VisualizationMarkersCfg:
-    """6 prototypes: palm + 4 fingertip targets + 1 large object marker."""
+    """5 prototypes: palm + 4 fingertip reference targets.
 
-    common_kwargs = dict(visible=True)
+    The object's reference pose is *not* drawn as a separate marker -- the
+    actual YCB mesh is already teleported to that pose every step via
+    ``write_root_pose_to_sim``, so the rendered object IS the target.
+
+    A 6th cyan sphere used to overlay the object COM here, but ``PreviewSurface``
+    opacity is unreliable in IsaacSim's MP4 render pass (the alpha gets
+    flattened to 1.0), and a 3 cm sphere completely hid flat objects like
+    the banana whose cross-section is also ~3 cm. The "halo above object"
+    indicator below is the lightweight replacement.
+    """
+
     return VisualizationMarkersCfg(
         prim_path="/Visuals/TrajTargets",
         markers={
@@ -136,10 +155,13 @@ def _make_marker_cfg() -> VisualizationMarkersCfg:
                     diffuse_color=(1.0, 0.85, 0.20), opacity=1.0
                 ),
             ),
-            "object_target": sim_utils.SphereCfg(
-                radius=0.030,
+            # Small floating cyan halo to mark "where the object should be"
+            # without obscuring the actual object underneath. Sits 8 cm above
+            # the object COM each frame.
+            "object_halo": sim_utils.SphereCfg(
+                radius=0.006,
                 visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.0, 1.0, 1.0), opacity=0.40
+                    diffuse_color=(0.0, 1.0, 1.0), opacity=1.0
                 ),
             ),
         },
@@ -186,8 +208,12 @@ def main() -> None:
     markers = VisualizationMarkers(_make_marker_cfg())
 
     # Marker prototype order matches our cfg dict insertion order:
-    #   0 palm, 1 thumb, 2 index, 3 middle, 4 ring, 5 object_target
+    #   0 palm, 1 thumb, 2 index, 3 middle, 4 ring, 5 object_halo
     proto_idx = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long, device=inner.device)
+    # Vertical offset for the cyan "object halo" so it floats above the
+    # actual object mesh instead of overlapping it (which used to hide
+    # flat objects like the banana).
+    OBJECT_HALO_Z_OFFSET = 0.08
 
     pregrasp_steps = int(inner._pregrasp_steps[0].item())
     imitate_steps = int(inner._imitate_steps[0].item())
@@ -221,8 +247,14 @@ def main() -> None:
         jpos_global = jpos_local + env_origins.unsqueeze(1)            # (E, 5, 3)
         obj_pos_global = obj_t_local + env_origins                     # (E, 3)
 
-        # Build (6, 3) marker translations for env 0.
-        marker_pos = torch.cat([jpos_global[0], obj_pos_global[0:1]], dim=0)  # (6, 3)
+        # Build (6, 3) marker translations for env 0:
+        # - 5 fingertip / palm reference dots
+        # - 1 cyan halo floating ``OBJECT_HALO_Z_OFFSET`` above the actual
+        #   object mesh (the mesh itself is already teleported to
+        #   ``obj_pos_global`` by ``write_root_pose_to_sim`` below).
+        halo_pos = obj_pos_global[0:1].clone()
+        halo_pos[:, 2] += OBJECT_HALO_Z_OFFSET
+        marker_pos = torch.cat([jpos_global[0], halo_pos], dim=0)  # (6, 3)
         markers.visualize(translations=marker_pos, marker_indices=proto_idx)
 
         # Teleport the actual object to the target (kinematic playback).

@@ -101,11 +101,19 @@ python scripts/visualize_trajectory.py \
     --num_envs 1 --headless \
     --num_steps 75 \
     --video_dir logs/traj_vis \
-    --trajectory ycb-006_mustard_bottle-20200709-subject-01-20200709_143211 \
+    --trajectory ycb-011_banana-20200709-subject-01-20200709_145401 \
     --stage 0
 ```
 
-视频出在 `logs/traj_vis/<obj>_stage<N>-step-0.mp4`。
+视频出在 `logs/traj_vis/trajectory-step-0.mp4`（前缀可以用 `--name_prefix` 改）。
+
+默认相机 `eye=(1.00, 0.95, 0.55)` → `lookat=(0.35, 0.35, 0.05)`，从机械臂
+外侧 NE 方向俯视、lookat z 压到 0.05，扁平物体（banana / plate）也在画面
+中央；以前默认 `eye=(0.59, 0.09, 0.29)` → `(0.35, 0.35, 0.12)` 站在机械臂
+和物体之间，看到的是手腕背面挡住物体，且 lookat 偏高让 banana 落在画面
+下边缘——升级前的视频是这个原因。
+
+要看 stage 3 的远角，把 lookat 拉到 stage 3 范围中心：`--cam_lookat 0.30 0.30 0.05`。
 
 ---
 
@@ -204,3 +212,4 @@ kill -9 <pid>; sleep 2; nvidia-smi --query-compute-apps=pid --format=csv,noheade
 | `pregrasp_failure` 居高不下 | PD 增益 / IK 速度前馈 / 接触阈值 | 见 migration.md §12 / §10 |
 | 物体一碰就飞 | 质量被硬写成 0.2 kg | 已修：`density=1000` 让 PhysX 算质量 |
 | `Metrics/stage` 一次跳两级 (0→2) | 升级时只清 buffer 没 force-reset，且 `min_episodes=200` 太低 | 已修：升级时 `_reset_idx(all)` + `min_episodes=num_envs`；详见 migration.md §12 #24 |
+| 某些 YCB 物体（banana / gelatin_box / cracker_box ...）渲染时透明 / 看不见 | `assets/ycb/visual/<obj>/textured_simple.obj.mtl` 里 `Tr 1.000000` = 完全透明（YCB 数据集的已知 bug，16 个物体里 12 个是这个值，只有 mustard / tomato_soup / potted_meat 例外） | 已修：把所有 `.mtl` 的 `Tr 1.000000` 全改成 `Tr 0.000000`，并清空 `cache/usd/ycb/` 让 MeshConverter 用修好的 mtl 重新转换。下次启动训练 / visualize 自动重生成。 |
