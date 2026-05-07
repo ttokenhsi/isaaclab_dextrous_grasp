@@ -60,9 +60,20 @@ def reset_trajectory_state(
     # Read the live curriculum stage from the cfg every reset so promotions
     # by the auto-curriculum take effect on the next env that resets,
     # without needing to mutate ``EventTermCfg.params`` from the outside.
-    stage = int(env.cfg.task.stage)
+    task_cfg = env.cfg.task
+    stage = int(task_cfg.stage)
+    # ``stage3_xy_range`` / ``stage3_yaw_abs`` are no-ops for stages 0/1/2;
+    # we forward them unconditionally so the trajectory module stays the
+    # single source of truth for stage semantics.
+    s3_xy = tuple(getattr(task_cfg, "stage3_xy_range", (0.20, 0.40)))
+    s3_yaw = float(getattr(task_cfg, "stage3_yaw_abs", 3.141592653589793 / 6.0))
     x, y, theta = trajectory_module.apply_stage_randomisation(
-        env._traj_buffers, static, env_ids, stage
+        env._traj_buffers,
+        static,
+        env_ids,
+        stage,
+        stage3_xy_range=s3_xy,
+        stage3_yaw_abs=s3_yaw,
     )
 
     # The buffers have been updated; sync the convenience aliases on the env.

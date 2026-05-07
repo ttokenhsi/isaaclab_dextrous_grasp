@@ -209,8 +209,25 @@ def sample_stage_params(
     env_ids: torch.Tensor,
     device: torch.device,
     init_object_height: float,
+    stage3_xy_range: tuple[float, float] = (0.20, 0.40),
+    stage3_yaw_abs: float = float(np.pi / 6.0),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample per-env (x, y, theta_z, init_z) for the given curriculum stage.
+    """Sample per-env ``(x, y, theta_z, init_z)`` for the given curriculum stage.
+
+    Stage map::
+
+        0  canonical (x, y, theta) = (0.35, 0.35, 0)
+        1  x, y ∼ U[0.30, 0.40],            theta = 0
+        2  x, y ∼ U[0.30, 0.40],            theta ∼ U[-pi/12, +pi/12]
+        3+ x, y ∼ U[stage3_xy_range],       theta ∼ U[-stage3_yaw_abs,
+                                                       +stage3_yaw_abs]
+
+    Stages 0/1/2 mirror ViViDex's curriculum exactly. Stage 3 is our
+    extension for harder generalisation: defaults to ±10 cm xy + ±30° yaw
+    (2× wider than stages 1/2 in both dimensions). Both ranges are sourced
+    from ``TaskCfg.stage3_xy_range`` / ``stage3_yaw_abs`` via
+    :func:`apply_stage_randomisation` so they can be tuned without editing
+    this module.
 
     Returns four (N,) float32 tensors aligned to ``env_ids`` order.
     """
@@ -224,11 +241,20 @@ def sample_stage_params(
         x = torch.empty((n,), device=device, dtype=torch.float32).uniform_(0.30, 0.40)
         y = torch.empty((n,), device=device, dtype=torch.float32).uniform_(0.30, 0.40)
         theta = torch.zeros((n,), device=device, dtype=torch.float32)
-    else:
+    elif stage == 2:
         x = torch.empty((n,), device=device, dtype=torch.float32).uniform_(0.30, 0.40)
         y = torch.empty((n,), device=device, dtype=torch.float32).uniform_(0.30, 0.40)
         theta = torch.empty((n,), device=device, dtype=torch.float32).uniform_(
             -np.pi / 12.0, np.pi / 12.0
+        )
+    else:
+        # stage >= 3: wider xy + wider yaw (configurable from TaskCfg).
+        x_lo, x_hi = float(stage3_xy_range[0]), float(stage3_xy_range[1])
+        x = torch.empty((n,), device=device, dtype=torch.float32).uniform_(x_lo, x_hi)
+        y = torch.empty((n,), device=device, dtype=torch.float32).uniform_(x_lo, x_hi)
+        yaw_abs = float(stage3_yaw_abs)
+        theta = torch.empty((n,), device=device, dtype=torch.float32).uniform_(
+            -yaw_abs, yaw_abs
         )
     init_z = torch.full((n,), float(init_object_height), device=device, dtype=torch.float32)
     return x, y, theta, init_z
@@ -239,11 +265,18 @@ def apply_stage_randomisation(
     static: TrajectoryStatic,
     env_ids: torch.Tensor,
     stage: int,
+    stage3_xy_range: tuple[float, float] = (0.20, 0.40),
+    stage3_yaw_abs: float = float(np.pi / 6.0),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Re-fill per-env trajectory buffers with newly sampled (x, y, theta_z).
 
     Returns ``(x, y, theta_z)`` so the caller can reuse them when placing the
     object / robot.
+
+    The optional ``stage3_xy_range`` / ``stage3_yaw_abs`` knobs only kick in
+    for ``stage >= 3``; stages 0/1/2 keep ViViDex's hard-coded ranges. They
+    are forwarded straight to :func:`sample_stage_params`, normally fed by
+    ``mdp/events.reset_trajectory_state`` from ``env.cfg.task``.
 
     Implementation notes
     --------------------
@@ -260,7 +293,14 @@ def apply_stage_randomisation(
     """
 
     device = buffers.obj_t.device
-    x, y, theta, init_z = sample_stage_params(stage, env_ids, device, static.init_object_height)
+    x, y, theta, init_z = sample_stage_params(
+        stage,
+        env_ids,
+        device,
+        static.init_object_height,
+        stage3_xy_range=stage3_xy_range,
+        stage3_yaw_abs=stage3_yaw_abs,
+    )
     n = env_ids.shape[0]
 
     # Canonical references (broadcast on demand to (n, ...)) ----------------

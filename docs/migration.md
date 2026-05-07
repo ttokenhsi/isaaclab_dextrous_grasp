@@ -186,15 +186,29 @@ IsaacLab 暴露 Gymnasium `truncation` 标志的标准方式。
 
 ## 7. 课程（`task.stage`）
 
-完全对齐 ViViDex 的 stage。这些旋转同时作用在轨迹**和**物体的初始
-姿态上（在 `reset_trajectory_state` 内做），保证手部参考与随机化
-后的物体位置一致：
+stage 0/1/2 完全对齐 ViViDex；stage 3 是我们扩展的更难阶段，范围由
+`TaskCfg.stage3_xy_range` / `TaskCfg.stage3_yaw_abs` 配置。这些旋转
+同时作用在轨迹**和**物体的初始姿态上（在 `reset_trajectory_state` 内
+做），保证手部参考与随机化后的物体位置一致：
 
 ```
 stage 0 → (x, y, θz) = (0.35, 0.35, 0)
-stage 1 → x, y ∼ U[0.30, 0.40]，θz = 0
-stage 2 → x, y ∼ U[0.30, 0.40]，θz ∼ U(-π/12, +π/12)
+stage 1 → x, y ∼ U[0.30, 0.40]，θz = 0                        # vividex
+stage 2 → x, y ∼ U[0.30, 0.40]，θz ∼ U(-π/12, +π/12)          # vividex
+stage 3 → x, y ∼ U[stage3_xy_range]，θz ∼ U(-yaw_abs, +yaw_abs)
+         # 默认 (0.20, 0.40) + π/6 ≈ stage 1/2 上界保持 0.40，
+         # 下界从 0.30 推到 0.20，yaw ±30°
 ```
+
+之所以用 `(0.20, 0.40)` 而不是 `(0.25, 0.45)`：上界 0.40 与 stage 1/2
+完全一致，policy 升 stage 时不需要重新学 +x/+y 极限，只需要适应新的
+-x/-y 极限，课程过渡更平滑。
+
+可达性：UR5 base 在 (0.765, -0.09)，UR5 reach ≈ 0.85 m。stage 3
+默认最远角点 (0.20, 0.40) 离 base 0.748 m（88% reach），仍在合理
+范围。如果再拉宽（e.g. `(0.15, 0.45)`），注意 (0.15, 0.45) 处距 base
+≈ 0.83 m，接近极限，IK 容易 saturate；建议同时把 `cart_lin_vel_limit`
+调大一点。
 
 ---
 

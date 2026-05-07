@@ -14,7 +14,8 @@ python scripts/train.py \
     --num_envs 4096 --headless
 ```
 
-- `TaskCfg.auto_curriculum=True` 默认开启：当滚动 buffer 里的 per-episode `pregrasp_success ≥ 0.95`（默认阈值）且累计 episode 数 ≥ `num_envs`（默认 min）后，env 会打印 `[CURRICULUM] stage X -> Y` 并强制 `_reset_idx` 全 env，下一步立即按新 stage 取样 (x, y, θ)，无需重启。`stage` 上限 `curriculum_max_stage=2`。
+- `TaskCfg.auto_curriculum=True` 默认开启：当滚动 buffer 里的 per-episode `pregrasp_success ≥ 0.95`（默认阈值）且累计 episode 数 ≥ `num_envs`（默认 min）后，env 会打印 `[CURRICULUM] stage X -> Y` 并强制 `_reset_idx` 全 env，下一步立即按新 stage 取样 (x, y, θ)，无需重启。`stage` 上限 `curriculum_max_stage=3`（0→1→2→3 三次升级）。
+- 4 个 stage：0 = canonical；1 = U[0.30, 0.40] xy；2 = + ±15° yaw（以上对齐 ViViDex）；3 = U[0.20, 0.40] xy + ±30° yaw（默认值，由 `TaskCfg.stage3_xy_range` / `stage3_yaw_abs` 配置）。stage 3 的上界与 stage 1/2 一致（0.40），只把下界从 0.30 推到 0.20，让升级更平滑。
 - 检查点写到 `logs/rsl_rl/allegro_ur5_relocate/<timestamp>/model_*.pt`，每 50 iter 一份。
 
 ### 1.2 边训练边录像（每 200 iter 一段近距离视频）

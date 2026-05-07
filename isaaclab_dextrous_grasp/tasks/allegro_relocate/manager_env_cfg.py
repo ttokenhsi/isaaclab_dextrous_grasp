@@ -334,8 +334,39 @@ class TaskCfg:
     """Capacity of the rolling per-episode success-rate buffer. ``0`` means
     use ``num_envs`` (vividex's Monitor uses the last 4096 episodes)."""
 
-    curriculum_max_stage: int = 2
-    """Highest stage the auto-curriculum will promote to (0/1/2)."""
+    curriculum_max_stage: int = 3
+    """Highest stage the auto-curriculum will promote to.
+
+    Stage map (also documented in ``trajectory.sample_stage_params``)::
+
+        0  canonical, (x, y, theta) = (0.35, 0.35, 0)
+        1  x, y ∼ U[0.30, 0.40],          theta = 0                  (vividex)
+        2  x, y ∼ U[0.30, 0.40],          theta ∼ U[-pi/12, pi/12]   (vividex)
+        3  x, y ∼ U[stage3_xy_range],     theta ∼ U[-stage3_yaw_abs,
+                                                    +stage3_yaw_abs] (extension)
+    """
+
+    # Stage-3 randomisation ranges. Default ``(0.20, 0.40)`` keeps the
+    # *upper* bound identical to vividex stage 1/2 (so the policy doesn't
+    # have to re-learn the +x/+y extreme on promotion) and only pushes the
+    # *lower* bound 10 cm further away from the UR5 base. Concretely:
+    #
+    # * canonical pose         : (0.35, 0.35), 0.61 m from base (0.765, -0.09)
+    # * stage 1/2 range        : [0.30, 0.40] (±5 cm around 0.35)
+    # * stage 3 default range  : [0.20, 0.40]  -- ``+10 cm towards low x/y``
+    # * far corner (0.20, 0.40): 0.75 m from base (88% of UR5's ~0.85 m reach)
+    # * near corner (0.40, 0.20): 0.47 m from base
+    #
+    # The yaw bound stays at ±30° = 2× stage 2's ±15°.
+    stage3_xy_range: tuple[float, float] = (0.20, 0.40)
+    """``(x_low, x_high)`` and ``(y_low, y_high)`` (same range for both axes)
+    used when ``stage == 3``. Tighten to keep the trajectory feasible or
+    widen for stronger generalisation; both x and y are sampled independently
+    from this uniform range."""
+
+    stage3_yaw_abs: float = math.pi / 6.0
+    """Absolute yaw bound used when ``stage == 3``: ``theta_z ∼ U[-abs, +abs]``.
+    Default ``pi/6`` ≈ 30°."""
 
 
 @configclass
