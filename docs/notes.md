@@ -14,7 +14,7 @@ python scripts/train.py \
     --num_envs 4096 --headless
 ```
 
-- `auto_curriculum=True` 是默认开启的，看到 TB 里 `Metrics/pregrasp_success ≥ 0.95` 后会自动 `[CURRICULUM] stage 0 -> 1`，无需重启。
+- `TaskCfg.auto_curriculum=True` 默认开启：当滚动 buffer 里的 per-episode `pregrasp_success ≥ 0.95`（默认阈值）且累计 episode 数 ≥ `num_envs`（默认 min）后，env 会打印 `[CURRICULUM] stage X -> Y` 并强制 `_reset_idx` 全 env，下一步立即按新 stage 取样 (x, y, θ)，无需重启。`stage` 上限 `curriculum_max_stage=2`。
 - 检查点写到 `logs/rsl_rl/allegro_ur5_relocate/<timestamp>/model_*.pt`，每 50 iter 一份。
 
 ### 1.2 边训练边录像（每 200 iter 一段近距离视频）
@@ -42,7 +42,9 @@ python scripts/train.py \
 
 不接 CLI，直接在 `manager_env_cfg.py` 里改 `TaskCfg.auto_curriculum = False`，
 或在脚本里 `env_cfg.task.auto_curriculum = False`。配合 `--stage 1` / `--stage 2`
-跑分段实验。
+跑分段实验。`scripts/train.py` 在 `__post_init__` 之后才赋值 `task.stage`，
+但 `mdp/events.reset_trajectory_state` 每次 reset 都从 `env.cfg.task.stage`
+活读，所以 CLI 覆盖一定生效（不再像旧代码那样被 `__post_init__` 静默吞掉）。
 
 ### 1.5 小规模 debug（少 env、少 iter、看 stdout）
 
@@ -149,9 +151,9 @@ tensorboard --logdir=./ --bind_all --port 6006
 
 关注的几条曲线：
 
-- `Metrics/pregrasp_success` ：**已对齐 ViViDex Monitor 语义**（最近 4096 集 episode 的 0/1 均值，稳态 0.99-1.0），过 0.95 自动升 stage。
-- `Metrics/pregrasp_success_timewise` ：旧口径，ceiling=0.75，仅做调试参考，不要看这条判断成功率。
-- `Metrics/stage` ：实时 stage（0/1/2），过渡期可能是分数（如 0.875）。
+- `Metrics/pregrasp_success` ：**已对齐 ViViDex Monitor 语义**（最近 `curriculum_history_size`（默认 num_envs）个 finished episode 的 0/1 均值，稳态 0.99-1.0），过 `curriculum_threshold`（默认 0.95）自动升 stage。源码：`manager_env._record_episode_success` 在每次 reset 时由 `mdp/events.reset_trajectory_state` 调用，把 `_pregrasp_success[env_ids]` 推进环形 buffer。
+- `Metrics/pregrasp_success_timewise` ：旧口径，per-step 平均 sticky bool，ceiling=`(imitate_steps - pregrasp_steps) / imitate_steps ≈ 0.75`，仅做调试参考，不要看这条判断成功率。
+- `Metrics/stage` ：实时读 `env.cfg.task.stage`。auto-curriculum 一旦升级会瞬时跳变（因为升级当 step 强制 reset 全部 env），不会有过渡期分数。
 - `Metrics/obj_lift` ：物体抬升量（m），ViViDex success_10 阈值 0.05。
 - `Metrics/num_finger_contacts` ：5 桶（4 指 + 掌）中接触数，max=5。
 - `Episode_Termination/*` ：终止类型分布，最后应几乎全 `time_out`。

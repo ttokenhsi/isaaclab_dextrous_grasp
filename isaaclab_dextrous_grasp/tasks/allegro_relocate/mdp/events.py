@@ -18,14 +18,20 @@ if TYPE_CHECKING:
 def reset_trajectory_state(
     env: "AllegroRelocateManagerEnv",
     env_ids: torch.Tensor,
-    stage: int = 0,
+    stage: int = 0,  # noqa: ARG001 -- kept for backward-compat, ignored
 ) -> None:
     """Re-sample (x, y, theta_z) per env and reset all per-env trajectory state.
 
     Steps (matches ViViDex's reset):
 
+    0. *(curriculum bookkeeping)* push the just-finished episode's
+       ``_pregrasp_success`` value (one bool per env in ``env_ids``) into
+       the rolling success-rate buffer so the curriculum manager can decide
+       when to promote the stage.
     1. Sample new (x, y, theta_z) for ``env_ids`` and overwrite per-env
        trajectory buffers via :func:`trajectory.apply_stage_randomisation`.
+       The ``stage`` is read from ``env.cfg.task.stage`` at runtime so the
+       curriculum can mutate it between resets.
     2. Recompute per-env final goal position (``traj_target_pos``).
     3. Reset state counters: ``current_step / traj_step / pregrasp_success``.
     4. Reset cached intermediates and cartesian error.
@@ -38,8 +44,23 @@ def reset_trajectory_state(
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device)
 
+    # ---- 0) record per-episode pregrasp-success for the curriculum -----
+    # Only envs that actually ran at least one step (``current_step > 0``)
+    # contribute. This naturally skips the very first env-construction reset
+    # (where every env has ``current_step == 0``) so the buffer doesn't get
+    # polluted with a flush of structural zeros.
+    if hasattr(env, "_record_episode_success"):
+        ran = env.current_step[env_ids] > 0
+        finished = env_ids[ran]
+        if finished.numel() > 0:
+            env._record_episode_success(finished, env._pregrasp_success[finished])
+
     # ---- 1) trajectory randomisation -----------------------------------
     static = env._traj_static
+    # Read the live curriculum stage from the cfg every reset so promotions
+    # by the auto-curriculum take effect on the next env that resets,
+    # without needing to mutate ``EventTermCfg.params`` from the outside.
+    stage = int(env.cfg.task.stage)
     x, y, theta = trajectory_module.apply_stage_randomisation(
         env._traj_buffers, static, env_ids, stage
     )

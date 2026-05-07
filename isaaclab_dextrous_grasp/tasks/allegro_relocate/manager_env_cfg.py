@@ -303,11 +303,39 @@ class TaskCfg:
     """``.npz`` filename (without extension) under ``trajectories/``."""
 
     stage: int = 0
-    """Curriculum stage. 0 = canonical, 1 = (x,y) random, 2 = + theta_z random."""
+    """Curriculum stage. 0 = canonical, 1 = (x,y) random, 2 = + theta_z random.
+
+    This is mutated **at runtime** by the auto-curriculum logic in
+    :class:`AllegroRelocateManagerEnv`. ``mdp/events.py`` reads the live value
+    from ``env.cfg.task.stage`` at every reset so that promotions take effect
+    immediately without needing a config rebuild or env restart.
+    """
 
     cart_lin_vel_limit: float = 1.0
     cart_ang_vel_limit: float = 1.0
     ik_damping: float = 0.05
+
+    # ---- Auto-curriculum (vividex Monitor 0.95 promotion rule) ----------
+    auto_curriculum: bool = True
+    """If ``True`` the env auto-promotes ``stage`` once the rolling
+    per-episode pregrasp-success rate exceeds ``curriculum_threshold``.
+    Set to ``False`` to lock the stage at whatever ``stage`` is set to."""
+
+    curriculum_threshold: float = 0.95
+    """Per-episode success rate (over the most recent
+    ``curriculum_min_episodes`` finished episodes) required to bump the stage."""
+
+    curriculum_min_episodes: int = 0
+    """Minimum number of completed episodes that must be in the rolling
+    history before a promotion can fire. ``0`` means use ``num_envs`` (so
+    each env has contributed at least one episode on average)."""
+
+    curriculum_history_size: int = 0
+    """Capacity of the rolling per-episode success-rate buffer. ``0`` means
+    use ``num_envs`` (vividex's Monitor uses the last 4096 episodes)."""
+
+    curriculum_max_stage: int = 2
+    """Highest stage the auto-curriculum will promote to (0/1/2)."""
 
 
 @configclass
@@ -470,8 +498,14 @@ class AllegroRelocateManagerEnvCfg(ManagerBasedRLEnvCfg):
         self.actions.arm_hand.cart_ang_vel_limit = self.task.cart_ang_vel_limit
         self.actions.arm_hand.ik_damping = self.task.ik_damping
 
-        # Propagate task curriculum stage into the reset event.
-        self.events.reset_traj.params["stage"] = self.task.stage
+        # NOTE: we deliberately do *not* copy ``self.task.stage`` into
+        # ``self.events.reset_traj.params`` here. The reset event reads the
+        # live value via ``env.cfg.task.stage`` at every reset, which lets
+        # the auto-curriculum logic in :class:`AllegroRelocateManagerEnv`
+        # bump the stage at runtime without having to keep two copies in
+        # sync. Older revisions of this file used to do the copy, and that
+        # silently broke ``--stage 1/2`` on the CLI because the override in
+        # ``train.py`` happens after ``__post_init__`` has already run.
 
         # Propagate reward shaping into individual terms.
         self.rewards.pregrasp.params = {"err_scale": self.reward.pregrasp_err_scale}
