@@ -77,25 +77,41 @@ parser.add_argument(
     "--cam_eye",
     type=float,
     nargs=3,
-    default=[1.05, 0.95, 0.55],
+    default=[0.5, 1.5, 0.55],
     metavar=("X", "Y", "Z"),
-    help="Camera eye, env-local frame (m). Default matches record_replay_data.py.",
+    help=(
+        "Camera eye, env-local frame (m). Default matches "
+        "visualize_trajectory.py: a close-in shoulder-height view from "
+        "behind the robot base, framing the bottle + hand."
+    ),
 )
 parser.add_argument(
     "--cam_lookat",
     type=float,
     nargs=3,
-    default=[0.40, 0.40, 0.18],
+    default=[0.5, 0.35, 0.12],
     metavar=("X", "Y", "Z"),
-    help="Camera lookat, env-local frame (m). Default matches record_replay_data.py.",
+    help="Camera lookat, env-local frame (m). Default: at the bottle spawn pose.",
 )
 parser.add_argument(
     "--cam_resolution",
     type=int,
     nargs=2,
-    default=[640, 480],
+    default=[1280, 720],
     metavar=("W", "H"),
     help="Recorded video resolution.",
+)
+parser.add_argument(
+    "--cam_vfov",
+    type=float,
+    default=69.4,
+    help=(
+        "Vertical FOV (deg) for the recording camera. IsaacLab's "
+        "default OmniverseKit_Persp prim has vfov ~35 deg (focal=18.1mm, "
+        "vert_aperture=11.79mm). 69.4 deg matches SAPIEN's ``relocate_viz`` "
+        "camera, which is what record_replay_data.py uses, so SAPIEN and "
+        "IsaacLab share the same framing."
+    ),
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -200,6 +216,42 @@ def main() -> None:
     inner = env.unwrapped
     device = inner.device
 
+    # ------------------------------------------------------------------
+    # Widen the OmniverseKit_Persp camera so vfov matches SAPIEN.
+    #
+    # IsaacLab's ``RecordVideo`` pulls frames from the prim named
+    # ``/OmniverseKit_Persp``, which by default ships with
+    # ``focal_length=18.14756mm`` and ``horizontal_aperture=20.955mm``.
+    # At 1280x720 that gives vfov ~ 35.5 deg -- much narrower than
+    # SAPIEN's ``relocate_viz`` (69.4 deg). To get the same framing we
+    # solve ``focal = (h_aperture * H/W) / (2 * tan(vfov/2))`` and write
+    # it back. We do this once after ``env.reset()`` so the modified
+    # focal length is in place before the first ``env.step()`` triggers
+    # a render.
+    # ------------------------------------------------------------------
+    import math as _math
+    from pxr import UsdGeom  # noqa: E402  (must be after AppLauncher)
+    from isaacsim.core.utils.stage import get_current_stage
+
+    stage = get_current_stage()
+    cam_prim = stage.GetPrimAtPath("/OmniverseKit_Persp")
+    if cam_prim.IsValid():
+        cam_geom = UsdGeom.Camera(cam_prim)
+        h_aperture = float(cam_geom.GetHorizontalApertureAttr().Get())
+        W, H = args_cli.cam_resolution
+        v_aperture = h_aperture * (H / W)
+        new_focal = v_aperture / (2.0 * _math.tan(_math.radians(args_cli.cam_vfov) / 2.0))
+        old_focal = float(cam_geom.GetFocalLengthAttr().Get())
+        cam_geom.GetFocalLengthAttr().Set(new_focal)
+        print(
+            f"[INFO] camera vfov: target={args_cli.cam_vfov:.2f} deg  "
+            f"focal_length: {old_focal:.3f} -> {new_focal:.3f} mm  "
+            f"(h_aperture={h_aperture:.3f}, v_aperture={v_aperture:.3f}, "
+            f"res={W}x{H})"
+        )
+    else:
+        print("[WARN] /OmniverseKit_Persp prim not found; FOV unchanged")
+
     robot = inner.scene["robot"]
     obj = inner.scene["object"]
 
@@ -216,6 +268,31 @@ def main() -> None:
 
     qpos_buf = torch.zeros((num_envs, 22), device=device)
     obj_pose_buf = torch.zeros((num_envs, 7), device=device)
+
+    # ------------------------------------------------------------------
+    # Monkey-patch the action manager so every PhysX substep re-teleports
+    # the robot joints + object pose. Without this hook the manager's
+    # ``apply_action`` (which the env.step loop calls 10 times per env
+    # step, one per 5 ms substep) lets the IKHandAction push PD targets
+    # derived from the zero action; the PD + gravity + finger-object
+    # contacts then drift state by ~50 ms before the render at the end
+    # of env.step captures the frame. That drift is what shows up as
+    # "jitter" / "object lags behind hand" in the first version of this
+    # script -- especially bad for the thin, long objects (large_clamp)
+    # or the mug handle. Re-writing state every substep collapses the
+    # drift window to one PhysX step.
+    # ------------------------------------------------------------------
+    action_manager = inner.action_manager
+    _orig_apply_action = action_manager.apply_action
+
+    def _teleport_apply_action():  # noqa: D401
+        robot.write_joint_state_to_sim(qpos_buf, zero_qvel)
+        robot.set_joint_position_target(qpos_buf)
+        obj.write_root_pose_to_sim(obj_pose_buf)
+        obj.write_root_velocity_to_sim(zero_vel_root)
+
+    action_manager.apply_action = _teleport_apply_action
+    print("[INFO] action_manager.apply_action patched -> per-substep teleport")
 
     for step in range(num_steps):
         # ---- Build this frame's lab-order qpos from the SAPIEN-order log ----
