@@ -86,11 +86,24 @@ def _quat_inv(q: torch.Tensor) -> torch.Tensor:
 
 
 def robot_state(env: "AllegroRelocateManagerEnv") -> torch.Tensor:
-    """qpos(22) + qvel(22) + 14 link [pos(3)+quat(4)+linvel(3)+angvel(3)] = 330."""
+    """qpos(22) + qvel(22) + 14 link [pos(3)+quat(4)+linvel(3)+angvel(3)] = 330.
+
+    qpos / qvel are reordered to SAPIEN's URDF declaration order
+    ``[arm_0..arm_5, joint_00, joint_01, ..., joint_15]`` because the ViViDex
+    policy was trained on that ordering. IsaacLab's default
+    ``robot.data.joint_pos`` returns joints in articulation internal order,
+    which for this URDF is *non-monotonic* for the hand. Without the
+    re-order the policy receives jumbled finger qpos values and produces
+    correspondingly garbage actions, which is the dominant reason "replay
+    works but policy doesn't" on a freshly-loaded checkpoint. The index
+    tensor is built once in
+    :meth:`AllegroRelocateManagerEnv._resolve_indices`.
+    """
 
     robot = env.scene["robot"]
-    qpos = robot.data.joint_pos                          # (E, 22)
-    qvel = robot.data.joint_vel                          # (E, 22)
+    sapien_idx = env._qpos_sapien_idx                    # (22,)
+    qpos = robot.data.joint_pos[:, sapien_idx]           # (E, 22) URDF order
+    qvel = robot.data.joint_vel[:, sapien_idx]           # (E, 22) URDF order
     links = _gather_links_blockwise(env, env._joint_link_body_idx)  # (E, 22*13)
     return torch.cat([qpos, qvel, links], dim=-1)
 

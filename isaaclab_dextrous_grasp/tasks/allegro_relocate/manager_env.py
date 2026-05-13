@@ -255,6 +255,30 @@ class AllegroRelocateManagerEnv(ManagerBasedRLEnv):
             )
         self._finger_body_idx = torch.tensor(finger_ids, device=self.device, dtype=torch.long)
 
+        # ------------------------------------------------------------------
+        # SAPIEN-compatible joint reordering.
+        #
+        # The ViViDex policy expects ``qpos`` in URDF declaration order:
+        #   [arm_0..arm_5, joint_00, joint_01, ..., joint_15]
+        # But IsaacLab's ``robot.data.joint_pos`` returns joints in articulation
+        # internal order, which for this URDF is non-monotonic for the hand:
+        #   [arm_0..arm_5, joint_00, joint_04, joint_08, joint_12, joint_01,
+        #    joint_05, joint_09, joint_13, joint_02, joint_06, joint_10, ...].
+        # We build an index tensor ``_qpos_sapien_idx`` that maps URDF position
+        # k -> IsaacLab joint id, so ``joint_pos[:, _qpos_sapien_idx]`` matches
+        # what SAPIEN's ``robot.get_qpos()`` would return to the policy at
+        # training time. Consumed by ``mdp/observations.py:robot_state``.
+        from .manager_env_cfg import ARM_JOINT_NAMES, HAND_JOINT_NAMES
+        sapien_order_names = list(ARM_JOINT_NAMES) + list(HAND_JOINT_NAMES)
+        sapien_ids, _ = robot.find_joints(sapien_order_names, preserve_order=True)
+        if len(sapien_ids) != len(sapien_order_names):
+            raise RuntimeError(
+                "Could not resolve all 22 robot joints in SAPIEN URDF order"
+            )
+        self._qpos_sapien_idx = torch.tensor(
+            sapien_ids, device=self.device, dtype=torch.long
+        )
+
     def _allocate_buffers(self) -> None:
         """Pre-allocate per-env trajectory + state buffers."""
 

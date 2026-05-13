@@ -202,20 +202,37 @@ def _build_robot_cfg(prim_path: str = "{ENV_REGEX_NS}/Robot") -> ArticulationCfg
         # ("# This PD is far larger than real to improve stability" -- vividex)
         # so that the IK target tracking error stays sub-mm and the imitate
         # reward landscape remains informative.
+        # IMPORTANT: ``effort_limit`` / ``velocity_limit`` on
+        # ``ImplicitActuatorCfg`` only feed back into IsaacLab's
+        # actuator-side clamp; PhysX itself still enforces the
+        # URDF-published joint limit (``<limit effort="0.35"/>`` for the
+        # Allegro hand here, ``150`` for the UR5 arm). Without
+        # ``effort_limit_sim`` the hand can produce at most 0.35 N·m per
+        # joint, which barely beats finger gravity, let alone closes
+        # against a 0.6 kg bottle. ViViDex's SAPIEN
+        # ``set_drive_property(force_limit=10)`` overrides the URDF, so
+        # the trained policy expects a 10 N·m budget per finger joint.
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=ARM_JOINT_NAMES,
                 stiffness=200000.0,
                 damping=40000.0,
-                effort_limit=500.0,
-                velocity_limit=2.0 * math.pi,
+                effort_limit_sim=500.0,
+                velocity_limit_sim=2.0 * math.pi,
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=HAND_JOINT_NAMES,
                 stiffness=200.0,
                 damping=60.0,
-                effort_limit=10.0,
-                velocity_limit=2.0 * math.pi,
+                effort_limit_sim=10.0,
+                # No velocity cap. SAPIEN's ``set_drive_property`` only
+                # exposes (stiffness, damping, force_limit, mode) and does
+                # not push a separate joint velocity limit through to
+                # PhysX. The trained ViViDex policy expects fingers to
+                # close as fast as the 10 N·m torque budget allows;
+                # keeping the URDF-published 6.28 rad/s cap silently slows
+                # finger motion below the SAPIEN baseline.
+                velocity_limit_sim=1000.0,
             ),
         },
         soft_joint_pos_limit_factor=1.0,
