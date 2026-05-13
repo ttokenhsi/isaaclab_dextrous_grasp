@@ -63,7 +63,9 @@ class AllegroRelocateManagerEnv(ManagerBasedRLEnv):
         self._traj_static = trajectory_module.load_trajectory(cfg.task.trajectory_name)
 
         # 2) Build the per-env RigidObjectCfg for the YCB object.
-        cfg.scene.object = self._build_object_cfg(self._traj_static.object_name)
+        #    Pass cfg explicitly because ``self.cfg`` is only assigned by the
+        #    base class ``__init__`` further down.
+        cfg.scene.object = self._build_object_cfg(self._traj_static.object_name, cfg=cfg)
 
         # 3) Re-scale the PhysX broad-phase pairs capacity now that the user
         #    may have updated ``cfg.scene.num_envs``. The default in
@@ -173,51 +175,94 @@ class AllegroRelocateManagerEnv(ManagerBasedRLEnv):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _build_object_cfg(self, object_name: str) -> RigidObjectCfg:
+    def _build_object_cfg(
+        self,
+        object_name: str,
+        cfg: AllegroRelocateManagerEnvCfg | None = None,
+    ) -> RigidObjectCfg:
         """Convert the YCB visual OBJ to USD (cached) and wrap in a
         :class:`RigidObjectCfg` with ``activate_contact_sensors=True``.
         """
 
         ensure_cache_dirs()
-        obj_obj_path = ycb_visual_obj(object_name)
-        if not obj_obj_path.exists():
-            raise FileNotFoundError(f"YCB visual OBJ not found: {obj_obj_path}")
+        # ViViDex uses two separate meshes per object:
+        #   * visual/<obj>/textured_simple.obj   -- high-detail, with UVs/MTL
+        #   * collision/<obj>/collision.obj      -- 2-group low-poly hull
+        # IsaacLab's :class:`MeshConverter` only takes a single ``asset_path``
+        # which is used for *both* rendering and the physics actor. We pick
+        # the textured visual OBJ here (so the spawned USD ships with a
+        # textured display mesh) and rely on PhysX's VHACD to decompose it
+        # into ``max_convex_hulls=2`` convex shells for collision -- which
+        # is what ViViDex's hand-authored ``collision.obj`` provides via its
+        # 2 OBJ sub-groups.
+        #
+        # Trade-off vs feeding the explicit ``collision.obj`` to
+        # ``MeshConverter``: VHACD on the 1.6 MB visual mesh produces 2
+        # slightly different hulls than ViViDex's hand-authored 2-group OBJ,
+        # which costs us about 0.04 mean return (3% relative). In return,
+        # the rendered bottle shows the proper YCB texture instead of a
+        # flat grey low-poly shell, which matters for video-based debugging
+        # and any future vision-based policy.
+        visual_obj_path = ycb_visual_obj(object_name)
+        if not visual_obj_path.exists():
+            raise FileNotFoundError(f"YCB visual OBJ not found: {visual_obj_path}")
 
         usd_dir = YCB_USD_CACHE / object_name
         usd_dir.mkdir(parents=True, exist_ok=True)
-        # Run the OBJ → USD conversion now (cheap if the cache is valid).
-        # Mass is computed from density (matches ViViDex
-        # ``ycb_object_utils.py:118-122`` which sets ``density=1000`` and
-        # lets SAPIEN compute the per-object mass from the convex
-        # decomposition volume). Hard-coding mass=0.2 kg made objects
-        # ~5× lighter than the real YCB items (mustard bottle ≈ 1 kg)
-        # and they would fly off on the slightest finger contact.
+        # Mass is hard-coded to the YCB-published value (~0.603 kg for the
+        # mustard bottle). PhysX' density x VHACD-volume product would be
+        # off by ~50% otherwise, which throws off the friction budget the
+        # ViViDex policy was trained against.
+        #
+        # ``max_convex_hulls=2`` is critical: with the default ~32-hull
+        # decomposition the mustard bottle's interior edges and stair-stepped
+        # surface let it squirt out of a 4-finger pinch grip. Capping at 2
+        # hulls reproduces ViViDex's 2-group ``collision.obj`` topology.
         mesh_cfg = MeshConverterCfg(
-            asset_path=str(obj_obj_path),
+            asset_path=str(visual_obj_path),
             usd_dir=str(usd_dir),
             usd_file_name="ycb.usd",
-            mass_props=schemas_cfg.MassPropertiesCfg(density=1000.0),
+            mass_props=schemas_cfg.MassPropertiesCfg(mass=0.603),
             rigid_props=schemas_cfg.RigidBodyPropertiesCfg(),
             collision_props=schemas_cfg.CollisionPropertiesCfg(collision_enabled=True),
-            mesh_collision_props=schemas_cfg.ConvexDecompositionPropertiesCfg(),
+            mesh_collision_props=schemas_cfg.ConvexDecompositionPropertiesCfg(
+                max_convex_hulls=2,
+                voxel_resolution=200_000,
+                shrink_wrap=True,
+            ),
             make_instanceable=False,
         )
         converter = MeshConverter(mesh_cfg)
         usd_path = converter.usd_path
+
+        # Optional grasp-stability tweaks, stashed on the task cfg's __dict__
+        # by play_vividex.py (kept off the configclass schema on purpose so
+        # they are pure runtime overrides). ``self.cfg`` is not yet bound
+        # because the base class ``__init__`` runs after this helper, so the
+        # caller passes ``cfg`` explicitly.
+        task_cfg = cfg.task if cfg is not None else getattr(self, "cfg", None)
+        task_dict = getattr(task_cfg, "__dict__", {})
+        obj_iters = task_dict.get("_object_solver_iters")
+        obj_max_depen = task_dict.get("_object_max_depen_vel")
+        rigid_props_kwargs: dict[str, Any] = dict(
+            disable_gravity=False,
+            retain_accelerations=False,
+        )
+        if obj_iters is not None:
+            rigid_props_kwargs["solver_position_iteration_count"] = int(obj_iters[0])
+            rigid_props_kwargs["solver_velocity_iteration_count"] = int(obj_iters[1])
+        if obj_max_depen is not None:
+            rigid_props_kwargs["max_depenetration_velocity"] = float(obj_max_depen)
 
         return RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             spawn=UsdFileCfg(
                 usd_path=usd_path,
                 activate_contact_sensors=True,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=False,
-                    retain_accelerations=False,
-                ),
-                # Density-based; the converter already wrote density=1000
-                # into the USD asset, but we re-affirm here in case the
-                # USD on disk was generated by an older converter run.
-                mass_props=sim_utils.MassPropertiesCfg(density=1000.0),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(**rigid_props_kwargs),
+                # Re-affirm here in case the USD on disk was generated by
+                # an older converter run with a different mass.
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.603),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
                 pos=(0.35, 0.35, max(self._traj_static.init_object_height, 0.05)),
