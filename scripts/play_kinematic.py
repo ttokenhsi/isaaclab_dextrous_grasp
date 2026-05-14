@@ -113,6 +113,23 @@ parser.add_argument(
         "IsaacLab share the same framing."
     ),
 )
+parser.add_argument(
+    "--hide_ground_grid",
+    action="store_true",
+    default=True,
+    help=(
+        "Hide the default Isaac grid pattern on /World/GroundPlane. The "
+        "collision plane stays in place; only the visible 'Environment' "
+        "mesh is set to invisible. This gives a clean uniform background "
+        "instead of the diagnostic grid lines."
+    ),
+)
+parser.add_argument(
+    "--show_ground_grid",
+    dest="hide_ground_grid",
+    action="store_false",
+    help="Keep the default Isaac grid pattern (overrides --hide_ground_grid).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -251,6 +268,32 @@ def main() -> None:
         )
     else:
         print("[WARN] /OmniverseKit_Persp prim not found; FOV unchanged")
+
+    # ------------------------------------------------------------------
+    # Hide the diagnostic grid pattern on the default Isaac ground plane.
+    #
+    # ``GroundPlaneCfg()`` spawns ``Environments/Grid/default_environment.usd``
+    # which contains a textured "theGrid" mesh under
+    # ``/World/GroundPlane/Environment``. The collision is on a separate
+    # ``Plane`` prim, so we can safely hide just the visual mesh.
+    # We walk the subtree and call MakeInvisible on every Mesh under
+    # ``/World/GroundPlane/Environment`` (the mesh itself plus any
+    # decorative children).
+    # ------------------------------------------------------------------
+    if args_cli.hide_ground_grid:
+        env_prim = stage.GetPrimAtPath("/World/GroundPlane/Environment")
+        if env_prim.IsValid():
+            n_hidden = 0
+            for prim in [env_prim, *env_prim.GetAllChildren()]:
+                if not prim.IsValid():
+                    continue
+                imageable = UsdGeom.Imageable(prim)
+                if imageable:
+                    imageable.MakeInvisible()
+                    n_hidden += 1
+            print(f"[INFO] hidden {n_hidden} prim(s) under /World/GroundPlane/Environment")
+        else:
+            print("[WARN] /World/GroundPlane/Environment not found; grid not hidden")
 
     robot = inner.scene["robot"]
     obj = inner.scene["object"]
