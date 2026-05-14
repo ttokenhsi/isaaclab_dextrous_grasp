@@ -77,7 +77,7 @@ parser.add_argument(
     "--cam_eye",
     type=float,
     nargs=3,
-    default=[0.5, 1.5, 0.55],
+    default=[0.5, 1.5, 1.0],
     metavar=("X", "Y", "Z"),
     help=(
         "Camera eye, env-local frame (m). Default matches "
@@ -89,7 +89,7 @@ parser.add_argument(
     "--cam_lookat",
     type=float,
     nargs=3,
-    default=[0.5, 0.35, 0.12],
+    default=[0.5, 0.35, 0.25],
     metavar=("X", "Y", "Z"),
     help="Camera lookat, env-local frame (m). Default: at the bottle spawn pose.",
 )
